@@ -1,0 +1,77 @@
+#include <Wire.h>
+#include "MPU6050.h"
+
+MPU6050 mpu;
+
+// Sampling task handle
+TaskHandle_t samplingTaskHandle = NULL;
+
+void samplingTask(void *parameter) {
+    const uint32_t samplePeriodUs = 500; // 0.5 ms = 2 kHz
+    uint32_t lastSampleTime = esp_timer_get_time();
+
+    while (true) {
+        uint32_t now = esp_timer_get_time();
+        if (now - lastSampleTime >= samplePeriodUs) {
+            lastSampleTime += samplePeriodUs;
+
+            int16_t ax, ay, az, gx, gy, gz;
+            mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+            float AccX = ax / 16384.0;
+            float AccY = ay / 16384.0;
+            float AccZ = az / 16384.0;
+
+            float GyroX = gx / 131.0;
+            float GyroY = gy / 131.0;
+            float GyroZ = gz / 131.0;
+
+            // For testing, print every 20th sample to avoid flooding Serial
+            static int counter = 0;
+            if (++counter >= 20) {
+                counter = 0;
+                Serial.print("t="); Serial.print(now);
+                Serial.print(" Acc: "); Serial.print(AccX,6);
+                Serial.print(AccY,6);
+                Serial.print(AccZ,6); Serial.print(" Gyro: ");
+                Serial.print(GyroX,6);
+                Serial.print(GyroY,6);
+                Serial.println(GyroZ,6);
+            }
+        }
+        // Optional: yield to other tasks
+        taskYIELD();
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+
+    Wire.begin(21, 22);
+    Wire.setClock(400000);
+
+    mpu.initialize();
+    if (!mpu.testConnection()) {
+        Serial.println("MPU6050 not found!");
+        while (true);
+    }
+
+    mpu.setRate(0); // internal 1 kHz, we are oversampling
+
+    // High-priority task for 2 kHz sampling
+    xTaskCreatePinnedToCore(
+        samplingTask,
+        "SamplingTask",
+        4096,
+        NULL,
+        3,       // higher priority
+        &samplingTaskHandle,
+        1        // core 1
+    );
+
+    Serial.println("Sampling at 2 kHz...");
+}
+
+void loop() {
+    // empty
+}
