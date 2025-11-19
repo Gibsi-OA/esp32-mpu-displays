@@ -1,0 +1,150 @@
+import serial
+import csv
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore
+from collections import deque
+from datetime import datetime
+
+# -----------------------------
+# Qt Import Fix (for PyQt5/6 or PySide2/6)
+# -----------------------------
+from PyQt5.QtWidgets import QApplication
+
+
+# -----------------------------
+# CONFIGURATION
+# -----------------------------
+SERIAL_PORT = '/dev/ttyUSB0'  # Change to your ESP32 port
+BAUD_RATE = 115200
+WINDOW_SECONDS = 20
+
+# -----------------------------
+# CREATE CSV FILE WITH TIMESTAMP
+# -----------------------------
+now = datetime.now()
+CSV_FILENAME = now.strftime("mpu6050_%Y%m%d_%H%M%S.csv")
+csv_file = open(CSV_FILENAME, 'w', newline='')
+csv_writer = csv.writer(csv_file)
+csv_writer.writerow(['Time_us', 'AccX_g', 'AccY_g', 'AccZ_g', 'GyroX_dps', 'GyroY_dps', 'GyroZ_dps'])
+
+# -----------------------------
+# ROLLING BUFFERS
+# -----------------------------
+time_buf = deque(maxlen=WINDOW_SECONDS * 2000)  # assuming 2 kHz max
+accx_buf = deque(maxlen=WINDOW_SECONDS * 2000)
+accy_buf = deque(maxlen=WINDOW_SECONDS * 2000)
+accz_buf = deque(maxlen=WINDOW_SECONDS * 2000)
+gyrox_buf = deque(maxlen=WINDOW_SECONDS * 2000)
+gyroy_buf = deque(maxlen=WINDOW_SECONDS * 2000)
+gyroz_buf = deque(maxlen=WINDOW_SECONDS * 2000)
+
+# -----------------------------
+# SERIAL SETUP
+# -----------------------------
+ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+
+# -----------------------------
+# PARSE SERIAL LINE
+# -----------------------------
+def parse_line(line):
+    line = line.strip()
+    if not line.startswith('t='):
+        return None
+    line = line.replace('t=', '').replace('Acc:', '').replace('Gyro:', '')
+    numbers = line.split()
+    if len(numbers) != 7:
+        return None
+    return [float(x) for x in numbers]
+
+# -----------------------------
+# PYQTGRAPH SETUP
+# -----------------------------
+app = QApplication([])
+win = pg.GraphicsLayoutWidget(show=True, title="MPU6050 Real-Time Plot")
+win.resize(1200, 800)
+win.setWindowTitle('MPU6050 Live Plot')
+
+# Accelerometer plot
+p1 = win.addPlot(title="Accelerometer")
+p1.showGrid(x=True, y=True)
+p1.addLegend()
+accx_curve = p1.plot(pen='r', name='AccX')
+accy_curve = p1.plot(pen='g', name='AccY')
+accz_curve = p1.plot(pen='b', name='AccZ')
+
+# Gyroscope plot
+win.nextRow()
+p2 = win.addPlot(title="Gyroscope")
+p2.showGrid(x=True, y=True)
+p2.addLegend()
+gyrox_curve = p2.plot(pen='r', name='GyroX')
+gyroy_curve = p2.plot(pen='g', name='GyroY')
+gyroz_curve = p2.plot(pen='b', name='GyroZ')
+
+# -----------------------------
+# UPDATE FUNCTION
+# -----------------------------
+def update():
+    while ser.in_waiting:
+        line = ser.readline().decode('utf-8', errors='ignore')
+        data = parse_line(line)
+        if data:
+            t_us, ax, ay, az, gx, gy, gz = data
+            t_sec = t_us / 1e6
+
+            # Append to buffers
+            time_buf.append(t_sec)
+            accx_buf.append(ax)
+            accy_buf.append(ay)
+            accz_buf.append(az)
+            gyrox_buf.append(gx)
+            gyroy_buf.append(gy)
+            gyroz_buf.append(gz)
+
+            # Save to CSV
+            csv_writer.writerow(data)
+
+    if len(time_buf) == 0:
+        return
+
+    # Keep only last WINDOW_SECONDS
+    t_max = time_buf[-1]
+    t_min = t_max - WINDOW_SECONDS
+    while len(time_buf) > 0 and time_buf[0] < t_min:
+        time_buf.popleft()
+        accx_buf.popleft()
+        accy_buf.popleft()
+        accz_buf.popleft()
+        gyrox_buf.popleft()
+        gyroy_buf.popleft()
+        gyroz_buf.popleft()
+
+    # Update plots
+    accx_curve.setData(list(time_buf), list(accx_buf))
+    accy_curve.setData(list(time_buf), list(accy_buf))
+    accz_curve.setData(list(time_buf), list(accz_buf))
+    gyrox_curve.setData(list(time_buf), list(gyrox_buf))
+    gyroy_curve.setData(list(time_buf), list(gyroy_buf))
+    gyroz_curve.setData(list(time_buf), list(gyroz_buf))
+
+    # Set X-axis range to last 20 seconds
+    p1.setXRange(t_min, t_max)
+    p2.setXRange(t_min, t_max)
+
+# -----------------------------
+# TIMER FOR REAL-TIME UPDATE
+# -----------------------------
+timer = QtCore.QTimer()
+timer.timeout.connect(update)
+timer.start(50)  # update every 50 ms
+
+# -----------------------------
+# RUN APPLICATION
+# -----------------------------
+try:
+    app.exec_()
+except KeyboardInterrupt:
+    print("Stopped by user")
+finally:
+    ser.close()
+    csv_file.close()

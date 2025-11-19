@@ -1,13 +1,34 @@
 import serial
 import csv
 import re
+import os
 
 # -----------------------------
 # CONFIGURATION
 # -----------------------------
-SERIAL_PORT = 'COM3'  # Replace with your port, e.g., 'COM3' on Windows or '/dev/ttyUSB0' on Linux
+SERIAL_PORT = '/dev/ttyUSB0'  # Change to your ESP32 port
 BAUD_RATE = 115200
 CSV_FILENAME = 'mpu6050_data.csv'
+
+# -----------------------------
+# FUNCTION TO PROCESS A LINE
+# -----------------------------
+def parse_line(line):
+    """
+    Convert a line like:
+    t=123456 Acc: 0.083130 0.091309 0.956787 Gyro: -1.969466 -4.213740 -1.923664
+    into a list of 7 numbers
+    """
+    line = line.strip()
+    if not line.startswith('t='):
+        return None
+    line = line.replace('t=', '')
+    line = line.replace('Acc:', '')
+    line = line.replace('Gyro:', '')
+    numbers = line.split()
+    if len(numbers) != 7:
+        return None
+    return numbers
 
 # -----------------------------
 # OPEN SERIAL PORT
@@ -15,35 +36,31 @@ CSV_FILENAME = 'mpu6050_data.csv'
 ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
 
 # -----------------------------
-# CREATE CSV FILE
+# CREATE CSV FILE (append if exists)
 # -----------------------------
-with open(CSV_FILENAME, 'w', newline='') as csvfile:
+file_exists = os.path.isfile(CSV_FILENAME)
+with open(CSV_FILENAME, 'a', newline='') as csvfile:
     writer = csv.writer(csvfile)
-    # Header
-    writer.writerow(['Time_us', 'AccX_g', 'AccY_g', 'AccZ_g', 'GyroX_dps', 'GyroY_dps', 'GyroZ_dps'])
+    if not file_exists:
+        writer.writerow(['Time_us', 'AccX_g', 'AccY_g', 'AccZ_g', 'GyroX_dps', 'GyroY_dps', 'GyroZ_dps'])
 
-    print("Reading data... Press Ctrl+C to stop.")
+    print(f"Logging data continuously to {CSV_FILENAME}. Press Ctrl+C to stop.")
 
     try:
         while True:
-            line = ser.readline().decode('utf-8').strip()
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
             if not line:
                 continue
 
-            # Fix missing spaces: add space between numbers after Acc: and Gyro:
-            line = re.sub(r'Acc:', 'Acc: ', line)
-            line = re.sub(r'Gyro:', ' Gyro: ', line)
-            line = re.sub(r'(?<=[0-9])(?=-?[0-9])', ' ', line)  # put space between numbers if missing
-
-            # Extract numbers
-            match = re.findall(r'-?\d+\.\d+|-?\d+', line)
-            if len(match) == 7:
-                writer.writerow(match)
+            nums = parse_line(line)
+            if nums:
+                writer.writerow(nums)
             else:
+                # Skip lines that are malformed
                 print("Skipping invalid line:", line)
 
     except KeyboardInterrupt:
         print("Stopped by user.")
 
-ser.close()
-print(f"Data saved to {CSV_FILENAME}")
+    finally:
+        ser.close()
