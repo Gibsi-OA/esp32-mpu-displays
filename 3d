@@ -1,0 +1,142 @@
+import numpy as np
+import serial
+from vispy import scene, io, app
+from vispy.visuals.transforms import MatrixTransform
+import math
+import time
+
+# -----------------------------
+# Serial connection
+# -----------------------------
+SERIAL_PORT = "/dev/ttyUSB0"
+BAUD_RATE = 115200
+
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.001)
+    ser.reset_input_buffer()
+except Exception as e:
+    print("Cannot open serial port:", e)
+    exit()
+
+# -----------------------------
+# VisPy canvas
+# -----------------------------
+canvas = scene.SceneCanvas(keys='interactive', show=True, bgcolor='white')
+view = canvas.central_widget.add_view()
+view.camera = 'turntable'
+
+# -----------------------------
+# Load OBJ plane
+# -----------------------------
+mesh = io.read_mesh('plane.obj')
+vertices, faces = mesh[0], mesh[1]
+
+plane_mesh = scene.visuals.Mesh(vertices=vertices, faces=faces,
+                                color=(0.2,0.5,1,0.8),
+                                parent=view.scene)
+
+transform = MatrixTransform()
+plane_mesh.transform = transform
+
+# -----------------------------
+# Complementary filter state
+# -----------------------------
+roll = 0.0     # rotation around X
+pitch = 0.0    # rotation around Y
+yaw = 0.0      # rotation around Z (no accel reference → only gyro)
+
+alpha = 0.98   # complementary filter coefficient
+last_time = time.time()
+
+latest_data = None
+
+# -----------------------------
+# Parse incoming serial IMU data
+# FORMAT:
+# t=xxxxx AccX AccY AccZ GyroX GyroY GyroZ
+# -----------------------------
+def read_latest():
+    global latest_data
+    while ser.in_waiting:
+        try:
+            line = ser.readline().decode().strip()
+            if not line.startswith("t="):
+                continue
+            p = line.split()
+
+            ax = float(p[1])
+            ay = float(p[2])
+            az = float(p[3])
+            gx = float(p[4])
+            gy = float(p[5])
+            gz = float(p[6])
+
+            latest_data = (ax, ay, az, gx, gy, gz)
+        except:
+            pass
+
+# -----------------------------
+# IMU orientation update (60 Hz)
+# -----------------------------
+def update_plane(ev):
+    global roll, pitch, yaw, last_time
+
+    read_latest()
+    if latest_data is None:
+        return
+
+    ax, ay, az, gx, gy, gz = latest_data
+
+    now = time.time()
+    dt = now - last_time
+    last_time = now
+
+    # --- Gyro integrate (degrees/sec → degrees)
+    roll_gyro  = roll  + gx * dt
+    pitch_gyro = pitch + gy * dt
+    yaw       += gz * dt  # yaw has no accel reference
+
+    # --- Accelerometer absolute roll/pitch ---
+    # roll: rotation about X
+    accel_roll  = math.degrees(math.atan2(ay, az))
+
+    # pitch: rotation about Y
+    accel_pitch = math.degrees(math.atan2(-ax, math.sqrt(ay*ay + az*az)))
+
+    # --- Complementary filter ---
+    roll  = alpha * roll_gyro  + (1 - alpha) * accel_roll
+    pitch = alpha * pitch_gyro + (1 - alpha) * accel_pitch
+
+    # Convert to radians
+    r = math.radians(roll)
+    p = math.radians(pitch)
+    y = math.radians(yaw)
+
+    # --- Build rotation matrices ---
+    Rx = np.array([[1, 0,        0,       0],
+                   [0, math.cos(r), -math.sin(r), 0],
+                   [0, math.sin(r),  math.cos(r), 0],
+                   [0, 0, 0, 1]])
+
+    Ry = np.array([[ math.cos(p), 0, math.sin(p), 0],
+                   [0, 1, 0, 0],
+                   [-math.sin(p), 0, math.cos(p), 0],
+                   [0, 0, 0, 1]])
+
+    Rz = np.array([[math.cos(y), -math.sin(y), 0, 0],
+                   [math.sin(y),  math.cos(y), 0, 0],
+                   [0, 0, 1, 0],
+                   [0, 0, 0, 1]])
+
+    # Apply rotation
+    transform.matrix = Rz @ Ry @ Rx
+
+# -----------------------------
+# Timer at 60 Hz
+# -----------------------------
+timer = app.Timer(interval=1/60, connect=update_plane, start=True)
+
+# -----------------------------
+# Run
+# -----------------------------
+app.run()
