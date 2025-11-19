@@ -1,0 +1,49 @@
+import serial
+import csv
+import re
+
+# -----------------------------
+# CONFIGURATION
+# -----------------------------
+SERIAL_PORT = 'COM3'  # Replace with your port, e.g., 'COM3' on Windows or '/dev/ttyUSB0' on Linux
+BAUD_RATE = 115200
+CSV_FILENAME = 'mpu6050_data.csv'
+
+# -----------------------------
+# OPEN SERIAL PORT
+# -----------------------------
+ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+
+# -----------------------------
+# CREATE CSV FILE
+# -----------------------------
+with open(CSV_FILENAME, 'w', newline='') as csvfile:
+    writer = csv.writer(csvfile)
+    # Header
+    writer.writerow(['Time_us', 'AccX_g', 'AccY_g', 'AccZ_g', 'GyroX_dps', 'GyroY_dps', 'GyroZ_dps'])
+
+    print("Reading data... Press Ctrl+C to stop.")
+
+    try:
+        while True:
+            line = ser.readline().decode('utf-8').strip()
+            if not line:
+                continue
+
+            # Fix missing spaces: add space between numbers after Acc: and Gyro:
+            line = re.sub(r'Acc:', 'Acc: ', line)
+            line = re.sub(r'Gyro:', ' Gyro: ', line)
+            line = re.sub(r'(?<=[0-9])(?=-?[0-9])', ' ', line)  # put space between numbers if missing
+
+            # Extract numbers
+            match = re.findall(r'-?\d+\.\d+|-?\d+', line)
+            if len(match) == 7:
+                writer.writerow(match)
+            else:
+                print("Skipping invalid line:", line)
+
+    except KeyboardInterrupt:
+        print("Stopped by user.")
+
+ser.close()
+print(f"Data saved to {CSV_FILENAME}")
