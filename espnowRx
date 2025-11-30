@@ -1,0 +1,66 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <MadgwickAHRS.h>
+#include "esp_wifi.h"
+
+
+// --- Data structure ---
+typedef struct {
+    int64_t t;
+    float AccX, AccY, AccZ;
+    float GyroX, GyroY, GyroZ;
+} dataRx;
+
+dataRx Rx;
+
+Madgwick filter;
+
+// -------------------------------------------------------
+// ESP-NOW Receive Callback
+// -------------------------------------------------------
+void OnDataRecv(const esp_now_recv_info * info, const uint8_t *incomingData, int len) {
+
+    // If you want the MAC address:
+    const uint8_t * mac = info->src_addr;
+
+    memcpy(&Rx, incomingData, sizeof(Rx));
+
+    float gx = Rx.GyroX * DEG_TO_RAD;
+    float gy = Rx.GyroY * DEG_TO_RAD;
+    float gz = Rx.GyroZ * DEG_TO_RAD;
+
+    filter.updateIMU(gx, gy, gz, Rx.AccX, Rx.AccY, Rx.AccZ);
+
+    Serial.printf(
+        "%lld %.4f %.4f %.4f %.4f %.4f %.4f  %.4f %.4f %.4f\n",
+        Rx.t,
+        Rx.AccX, Rx.AccY, Rx.AccZ,
+        Rx.GyroX, Rx.GyroY, Rx.GyroZ,
+        filter.getRoll(),
+        filter.getPitch(),
+        filter.getYaw()
+    );
+}
+
+
+// -------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE); // force channel 1
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed!");
+    return;
+  }
+
+  esp_now_register_recv_cb(OnDataRecv);
+
+  // Madgwick sample rate must match TX sample rate
+  filter.begin(1000);   // 1000 Hz sampling
+}
+
+void loop() {
+}
