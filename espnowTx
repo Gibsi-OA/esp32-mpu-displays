@@ -1,74 +1,371 @@
+#include <Wire.h>
+#include <MPU6050.h> // Assuming the standard MPU6050 library is used
 #include <esp_now.h>
 #include <WiFi.h>
-#include "I2Cdev.h"
-#include "MPU6050.h"
-#include "esp_timer.h"
+#include <SD.h>
+#include <freertos/task.h> 
 
+// --- Settings ---
+#define BUFFER_SIZE 2048        
+#define BATCH_SIZE 16           
+#define SD_WRITE_BATCH_SIZE 64  
+#define DATA_FILE_PATH "/data.csv" // Changed to CSV
+
+// --- Pins ---
+#define MPU_SDA 21          // I2C SDA Pin
+#define MPU_SCL 22          // I2C SCL Pin
+#define SD_CS_PIN 5         // SD Chip Select Pin (Required for SD initialization)
+
+// --- Global Objects ---
 MPU6050 mpu;
-uint8_t broadcastAddress[] = {0xD8,0xBC,0x38,0xFB,0x56,0x64};
+// Data structure: 8 bytes (int64) + 6 * 4 bytes (float) = 32 bytes per sample
+struct dataTx {
+  int64_t t;
+  float AccX, AccY, AccZ;
+  float GyroX, GyroY, GyroZ;
+};
 
-typedef struct {
-    int64_t t;
-    float AccX, AccY, AccZ;
-    float GyroX, GyroY, GyroZ;
-} dataTx;
+// --- Global Task Handle for Core 1 ---
+TaskHandle_t MPU_Task_Handle = NULL;
 
-dataTx Tx;
+// --- Buffers and Indices ---
+dataTx ring[BUFFER_SIZE];
+volatile uint16_t writeIndex = 0;       
+volatile uint16_t espNowReadIndex = 0;  
+volatile uint16_t sdReadIndex = 0;      
 
-float gyroXOffset=0, gyroYOffset=0, gyroZOffset=0;
-esp_timer_handle_t periodic_timer;
+// --- Calibration Offsets ---
+float gyroXOffset = 0, gyroYOffset = 0, gyroZOffset = 0;
 
-void samplingTask(void* arg){
-  int16_t ax,ay,az,gx,gy,gz;
-  mpu.getMotion6(&ax,&ay,&az,&gx,&gy,&gz);
+// --- ESP-NOW ---
+uint8_t broadcastAddress[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
-  Tx.AccX = ax/16384.0;
-  Tx.AccY = ay/16384.0;
-  Tx.AccZ = az/16384.0;
+// --- SD ---
+File dataFile;
+// Buffer to hold CSV strings before writing to SD (max 64 samples * ~150 chars/sample)
+char csvStringBuffer[SD_WRITE_BATCH_SIZE * 150]; 
 
-  Tx.GyroX = gx/131.0 - gyroXOffset;
-  Tx.GyroY = gy/131.0 - gyroYOffset;
-  Tx.GyroZ = gz/131.0 - gyroZOffset;
-
-  Tx.t = esp_timer_get_time();
-
-  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t*)&Tx, sizeof(Tx));
-  if(result != ESP_OK) Serial.printf("Send failed: %d\n", result);
+// =============================================================
+//               Timer ISR: Triggers Core 1 Task
+// =============================================================
+void IRAM_ATTR timerCallback(void *arg) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    
+    if (MPU_Task_Handle != NULL) {
+      // Wake up Core 1 task to perform the I2C read
+      vTaskNotifyGiveFromISR(MPU_Task_Handle, &xHigherPriorityTaskWoken);
+    }
+    
+    if (xHigherPriorityTaskWoken == pdTRUE) {
+      portYIELD_FROM_ISR();
+    }
 }
 
-void setup(){
-  Serial.begin(115200);
-  Wire.begin();  // Important for ESP32
-  mpu.initialize();
-  if(!mpu.testConnection()){ Serial.println("MPU6050 not found!"); while(1); }
+// =============================================================
+//               caliration of gyro
+// =============================================================
+void calibrateGyro() {
+  Serial.println("Starting Gyro Calibration (500 samples)...");
+  const int samples = 500;
+  float sumX = 0, sumY = 0, sumZ = 0;
+  int16_t gx, gy, gz, ax, ay, az;
   
-  WiFi.mode(WIFI_STA);
-  if(esp_now_init() != ESP_OK){ Serial.println("ESP-NOW init failed"); while(1); }
-  
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-  peerInfo.channel = 1;
-  peerInfo.encrypt = false;
-  esp_now_add_peer(&peerInfo);
-
-  // calibrate gyro
-  const int samples=500; float sumX=0,sumY=0,sumZ=0;
-  int16_t ax,ay,az,gx,gy,gz;
-  for(int i=0;i<samples;i++){
-    mpu.getMotion6(&ax,&ay,&az,&gx,&gy,&gz);
-    sumX+=gx/131.0; sumY+=gy/131.0; sumZ+=gz/131.0;
+  for (int i = 0; i < samples; i++) {
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    sumX += gx / 131.0;
+    sumY += gy / 131.0;
+    sumZ += gz / 131.0;
     delay(5);
   }
-  gyroXOffset=sumX/samples; gyroYOffset=sumY/samples; gyroZOffset=sumZ/samples;
+  
+  gyroXOffset = sumX / samples;
+  gyroYOffset = sumY / samples;
+  gyroZOffset = sumZ / samples;
 
-  // periodic timer
-  const esp_timer_create_args_t periodic_timer_args = {
-      .callback = &samplingTask,
-      .arg = NULL,
-      .name = "sampling_timer"
-  };
-  esp_timer_create(&periodic_timer_args, &periodic_timer);
-  esp_timer_start_periodic(periodic_timer, 1000); // 1 kHz
+  Serial.printf("Calibration complete. X: %.3f, Y: %.3f, Z: %.3f\n", gyroXOffset, gyroYOffset, gyroZOffset);
 }
 
-void loop(){}
+// =============================================================
+//               CORE 1: Dedicated MPU Reading Task (1kHz)
+// =============================================================
+void mpuTask(void *pvParameters) {
+  vTaskDelay(pdMS_TO_TICKS(500)); 
+  int16_t ax, ay, az, gx, gy, gz;
+
+  while (1) {
+    // Wait for notification from the esp_timer (1ms period)
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY); 
+
+    dataTx s;
+    
+    // Time the sample immediately when the timer triggers
+    s.t = esp_timer_get_time();
+    
+    // Perform the I2C read operation using the MPU library
+    // THIS IS THE BOTTLENECK (~1.8ms on GY-521)
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+    // Conversion to physical units (using +/- 2g and +/- 250 deg/s scaling)
+    s.AccX = ax / 16384.0;
+    s.AccY = ay / 16384.0;
+    s.AccZ = az / 16384.0;
+    s.GyroX = gx / 131.0 - gyroXOffset;
+    s.GyroY = gy / 131.0 - gyroYOffset;
+    s.GyroZ = gz / 131.0 - gyroZOffset;
+
+    // Write to ring buffer
+    ring[writeIndex] = s; 
+    writeIndex = (writeIndex + 1) % BUFFER_SIZE;
+  }
+}
+
+// --- CORE 0: Helper Functions (Logging and Communications) ---
+
+void sendBatch() {
+  uint16_t count = 0;
+  dataTx batch[BATCH_SIZE];
+
+  uint16_t currentWrite = writeIndex; 
+  
+  // Safely copy data from ring buffer
+  while(count < BATCH_SIZE && espNowReadIndex != currentWrite){
+    batch[count] = ring[espNowReadIndex];
+    
+    espNowReadIndex = (espNowReadIndex + 1) % BUFFER_SIZE;
+    count++;
+  }
+
+  if(count > 0){
+    esp_now_send(broadcastAddress, (uint8_t*)batch, count * sizeof(dataTx));
+  }
+}
+
+// =============================================================
+//               Writes a batch of structs as CSV to SD
+// =============================================================
+void saveCsvBatchToSD() {
+  if(!dataFile) return;
+
+  uint16_t samplesToProcess = 0;
+  uint16_t tempRead = sdReadIndex;
+  uint16_t currentWrite = writeIndex;
+  
+  if (currentWrite >= tempRead) {
+      samplesToProcess = currentWrite - tempRead;
+  } else {
+      samplesToProcess = BUFFER_SIZE - tempRead + currentWrite;
+  }
+  
+  if (samplesToProcess > SD_WRITE_BATCH_SIZE) {
+      samplesToProcess = SD_WRITE_BATCH_SIZE;
+  }
+  
+  if (samplesToProcess == 0) return; 
+
+  char *bufferPtr = csvStringBuffer;
+  int bufferLen = 0;
+  uint16_t processedCount = 0;
+
+  for (uint16_t i = 0; i < samplesToProcess; i++) {
+    dataTx s = ring[tempRead]; // Read struct from ring buffer
+    
+    // Convert struct to CSV string and append to buffer
+    int len = snprintf(bufferPtr, sizeof(csvStringBuffer) - bufferLen, 
+                       "%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                       s.t, s.AccX, s.AccY, s.AccZ, s.GyroX, s.GyroY, s.GyroZ);
+
+    if (len > 0 && (bufferLen + len) < sizeof(csvStringBuffer)) {
+        bufferPtr += len;
+        bufferLen += len;
+        processedCount++;
+        tempRead = (tempRead + 1) % BUFFER_SIZE;
+    } else {
+        // Break if buffer is full (or snprintf failed)
+        break; 
+    }
+  }
+
+  // Write the collected batch of CSV strings to the SD file
+  if (bufferLen > 0) {
+      dataFile.write((const uint8_t*)csvStringBuffer, bufferLen); 
+  }
+  
+  // Only update index for successfully processed samples
+  sdReadIndex = tempRead; 
+}
+
+// =============================================================
+//               Reads CSV file and outputs to Serial
+// =============================================================
+void readAndOutputSD() {
+    Serial.println("\n--- STARTING DATA DUMP ---");
+    
+    // Suspend MPU task while reading
+    if(MPU_Task_Handle != NULL) vTaskSuspend(MPU_Task_Handle); 
+
+    if (dataFile) {
+        dataFile.close();
+    }
+    
+    delay(2000); // Give time for file system operations
+    
+    // Open the file for reading (CSV format)
+    File readFile = SD.open(DATA_FILE_PATH, FILE_READ);
+
+    if (!readFile) {
+        Serial.printf("ERROR: Could not open %s for reading. Check SD card.\n", DATA_FILE_PATH);
+        if(MPU_Task_Handle != NULL) vTaskResume(MPU_Task_Handle);
+        return; 
+    }
+
+    Serial.printf("Contents of %s:\n", DATA_FILE_PATH);
+    
+    // Read and print CSV content line by line
+    String line;
+    while (readFile.available()) {
+        line = readFile.readStringUntil('\n');
+        Serial.println(line);
+        yield(); 
+    }
+
+    readFile.close();
+    Serial.println("--- DATA DUMP COMPLETE. You can now copy the data above. ---");
+    
+    // Reopen file for appending new data
+    dataFile = SD.open(DATA_FILE_PATH, FILE_APPEND);
+    if (!dataFile) {
+        Serial.println("ERROR: Failed to reopen logging file.");
+    }
+    
+    if(MPU_Task_Handle != NULL) vTaskResume(MPU_Task_Handle);
+}
+
+
+// =============================================================
+//                           SETUP
+// =============================================================
+void setup() {
+  Serial.begin(115200);
+  
+  // --- I2C Initialization (1000kHz Fast Mode Plus) ---
+  Wire.begin(MPU_SDA, MPU_SCL); 
+  Wire.setClock(1000000); // 1MHz: Fastest possible I2C speed
+  
+  // --- MPU6050 INIT ---
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("ERROR: MPU6050 connection failed!");
+    while (1);
+  }
+  Serial.println("MPU6050 Initialized.");
+
+  // Set MPU internal sample rate to 1kHz
+  mpu.setRate(0); // 8 kHz / (1 + 0) = 8 kHz gyroscope internal. Accel updates at 1 kHz.
+
+  // --- Calibrate ---
+  calibrateGyro();
+  
+  // --- SD CARD SETUP ---
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("SD init failed!");
+  } else {
+    // Check if file exists to decide if we need to write header
+    bool fileExists = SD.exists(DATA_FILE_PATH);
+    
+    dataFile = SD.open(DATA_FILE_PATH, FILE_APPEND);
+    
+    if (!dataFile) {
+      Serial.printf("Failed to open %s file!\n", DATA_FILE_PATH);
+    } else {
+      Serial.printf("SD file %s opened successfully.\n", DATA_FILE_PATH);
+      
+      // Write header if the file is newly created or empty
+      if (!fileExists || dataFile.size() == 0) {
+        dataFile.println("t_us,AccX,AccY,AccZ,GyroX,GyroY,GyroZ");
+        dataFile.flush();
+        Serial.println("CSV Header written.");
+      }
+    }
+  }
+
+  // --- ESP-NOW Initialization (Core 0) ---
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+  }
+  
+  esp_now_peer_info_t peerInfo = {};
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 1;   
+  peerInfo.encrypt = false;
+  
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add broadcast peer");
+  }
+  
+  // --- Create Dedicated MPU Task on Core 1 ---
+  xTaskCreatePinnedToCore(
+    mpuTask,            // Task function
+    "MPU_Task",         // Task name
+    4096,               // Stack size
+    NULL,               // Parameter
+    20,                 // Priority (Highest)
+    &MPU_Task_Handle,   // Task handle
+    1                   // Core 1
+  );
+
+  // --- START 1 KHZ TIMER ---
+  const esp_timer_create_args_t periodic_timer_args = {
+      .callback = &timerCallback,
+      .arg = NULL,
+      .dispatch_method = ESP_TIMER_TASK,
+      .name = "sampling"
+  };
+
+  esp_timer_handle_t periodic_timer;
+  esp_timer_create(&periodic_timer_args, &periodic_timer);
+
+  // 1000 µs = 1 sample per ms = 1 kHz
+  esp_timer_start_periodic(periodic_timer, 1000);
+  
+  delay(100); 
+
+  Serial.println("MPU6050 sampling clock started at 1kHz using esp_timer (I2C reading bottleneck expected).");
+  
+  // --- AUTODUMP ---
+  readAndOutputSD(); 
+}
+
+// =============================================================
+//                           LOOP
+// =============================================================
+void loop() {
+  static unsigned long lastSend = 0;
+  static unsigned long lastSDProcess = 0;
+  static unsigned long lastSDFlush = 0;
+
+  unsigned long now = millis();
+  
+  // --- 1. ESP-NOW Send at ~250Hz (every 4ms) ---
+  if(now - lastSend >= 4){ 
+    lastSend = now;
+    sendBatch();
+  }
+
+  // --- 2. SD CSV Process at ~10ms (100Hz) ---
+  if(now - lastSDProcess >= 10){
+    lastSDProcess = now;
+    saveCsvBatchToSD();
+  }
+  
+  // --- 3. SD Flush Periodically (every 500ms) ---
+  if(now - lastSDFlush >= 500){
+    lastSDFlush = now;
+    if(dataFile) {
+        dataFile.flush();
+    }
+  }
+  
+  vTaskDelay(1); 
+}
