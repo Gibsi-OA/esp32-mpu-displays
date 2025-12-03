@@ -1,0 +1,204 @@
+import serial
+import csv
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget,
+    QLabel, QVBoxLayout, QSplitter
+)
+from PyQt5.QtCore import Qt
+from collections import deque
+from datetime import datetime
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+SERIAL_PORT = '/dev/ttyUSB0'
+BAUD_RATE = 115200
+WINDOW_SECONDS = 20
+
+# -----------------------------
+# CSV INIT
+# -----------------------------
+now = datetime.now()
+CSV_FILENAME = now.strftime("imu_%Y%m%d_%H%M%S.csv")
+csv_file = open(CSV_FILENAME, 'w', newline='')
+csv_writer = csv.writer(csv_file)
+
+csv_writer.writerow([
+    'Time_us', 'AccX', 'AccY', 'AccZ',
+    'GyroX', 'GyroY', 'GyroZ',
+    'Pitch', 'Roll', 'Yaw',
+    'MagX', 'MagY', 'MagZ',
+    'Temp'
+])
+
+# -----------------------------
+# BUFFERS
+# -----------------------------
+buf_len = WINDOW_SECONDS * 2000
+
+time_buf = deque(maxlen=buf_len)
+accx_buf = deque(maxlen=buf_len)
+accy_buf = deque(maxlen=buf_len)
+accz_buf = deque(maxlen=buf_len)
+gyrox_buf = deque(maxlen=buf_len)
+gyroy_buf = deque(maxlen=buf_len)
+gyroz_buf = deque(maxlen=buf_len)
+
+# -----------------------------
+# SERIAL
+# -----------------------------
+ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.01)
+
+def parse_line(line):
+    try:
+        s = line.strip().split(',')
+        if len(s) != 14:
+            return None
+        t = int(s[0])
+        ax, ay, az = map(float, s[1:4])
+        gx, gy, gz = map(float, s[4:7])
+        mx, my, mz = map(float, s[7:10])
+        temp = float(s[10])
+        roll, pitch, yaw = map(float, s[11:14])
+        return [t, ax, ay, az, gx, gy, gz, pitch, roll, yaw, mx, my, mz, temp]
+    except:
+        return None
+
+# -----------------------------
+# MAIN WINDOW
+# -----------------------------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("IMU Live Dashboard")
+        self.setGeometry(200, 100, 1400, 900)
+
+        splitter = QSplitter(Qt.Horizontal)
+        self.setCentralWidget(splitter)
+
+        # -------------------------
+        # Graphs
+        # -------------------------
+        graph_widget = QWidget()
+        graph_layout = QVBoxLayout()
+        graph_widget.setLayout(graph_layout)
+        self.pg_widget = pg.GraphicsLayoutWidget()
+        graph_layout.addWidget(self.pg_widget)
+
+        # Accelerometer
+        self.p1 = self.pg_widget.addPlot(title="Accelerometer (g)")
+        self.p1.addLegend()
+        self.p1.showGrid(x=True, y=True)
+        self.accx_curve = self.p1.plot(pen='r', name="AccX")
+        self.accy_curve = self.p1.plot(pen='g', name="AccY")
+        self.accz_curve = self.p1.plot(pen='b', name="AccZ")
+
+        # Gyroscope
+        self.pg_widget.nextRow()
+        self.p2 = self.pg_widget.addPlot(title="Gyroscope (dps)")
+        self.p2.addLegend()
+        self.p2.showGrid(x=True, y=True)
+        self.gx_curve = self.p2.plot(pen='r', name="GyroX")
+        self.gy_curve = self.p2.plot(pen='g', name="GyroY")
+        self.gz_curve = self.p2.plot(pen='b', name="GyroZ")
+
+        splitter.addWidget(graph_widget)
+
+        # -------------------------
+        # Euler panel
+        # -------------------------
+        panel = QWidget()
+        layout = QVBoxLayout()
+        panel.setLayout(layout)
+
+        self.pitch_label = QLabel("Pitch: 0°")
+        self.roll_label = QLabel("Roll: 0°")
+        self.yaw_label = QLabel("Yaw: 0°")
+        for lbl in (self.pitch_label, self.roll_label, self.yaw_label):
+            lbl.setStyleSheet("font-size: 26px; font-weight: bold; padding: 10px;")
+            layout.addWidget(lbl)
+        layout.addStretch(1)
+        splitter.addWidget(panel)
+
+        splitter.setStretchFactor(0, 8)
+        splitter.setStretchFactor(1, 2)
+
+        # -------------------------
+        # Timer
+        # -------------------------
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_data)
+        self.timer.start(15)
+
+    def update_data(self):
+        while ser.in_waiting:
+            line = ser.readline().decode('utf-8', errors='ignore')
+            data = parse_line(line)
+            if not data:
+                continue
+
+            (t_us, ax, ay, az,
+             gx, gy, gz,
+             pitch, roll, yaw,
+             mx, my, mz, temp) = data
+
+            t_sec = t_us / 1e6
+
+            # Append to buffers
+            time_buf.append(t_sec)
+            accx_buf.append(ax)
+            accy_buf.append(ay)
+            accz_buf.append(az)
+            gyrox_buf.append(gx)
+            gyroy_buf.append(gy)
+            gyroz_buf.append(gz)
+
+            # Update Euler labels
+            self.pitch_label.setText(f"Pitch: {pitch:.2f}°")
+            self.roll_label.setText(f"Roll: {roll:.2f}°")
+            self.yaw_label.setText(f"Yaw: {yaw:.2f}°")
+
+            # CSV log
+            csv_writer.writerow(data)
+
+        if len(time_buf) < 2:
+            return
+
+        # Keep only last WINDOW_SECONDS
+        t_max = time_buf[-1]
+        t_min = t_max - WINDOW_SECONDS
+        while time_buf and time_buf[0] < t_min:
+            time_buf.popleft()
+            accx_buf.popleft()
+            accy_buf.popleft()
+            accz_buf.popleft()
+            gyrox_buf.popleft()
+            gyroy_buf.popleft()
+            gyroz_buf.popleft()
+
+        # Update plots
+        self.accx_curve.setData(list(time_buf), list(accx_buf))
+        self.accy_curve.setData(list(time_buf), list(accy_buf))
+        self.accz_curve.setData(list(time_buf), list(accz_buf))
+        self.gx_curve.setData(list(time_buf), list(gyrox_buf))
+        self.gy_curve.setData(list(time_buf), list(gyroy_buf))
+        self.gz_curve.setData(list(time_buf), list(gyroz_buf))
+
+        self.p1.setXRange(t_min, t_max)
+        self.p2.setXRange(t_min, t_max)
+
+
+# -----------------------------
+# RUN
+# -----------------------------
+app = QApplication([])
+win = MainWindow()
+win.show()
+
+try:
+    app.exec_()
+finally:
+    ser.close()
+    csv_file.close()
