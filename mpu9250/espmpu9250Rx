@@ -1,0 +1,78 @@
+#include <WiFi.h>
+#include <esp_now.h>
+
+// -----------------------
+// Data structure expected from transmitter
+// -----------------------
+typedef struct __attribute__((packed)) {
+  int64_t t_us;
+  float acc[3];
+  float gyro[3];
+  float mag[3];
+  float temp;
+  float roll, pitch, yaw;
+} imu_packet_t;
+
+imu_packet_t pkt;
+
+// -----------------------
+// ESP-NOW callback (NEW format!)
+// -----------------------
+void onDataReceived(const esp_now_recv_info_t *recv_info,
+                    const uint8_t *data, int data_len) 
+{
+  if (data_len != sizeof(imu_packet_t)) {
+    Serial.println("Invalid packet size!");
+    return;
+  }
+
+  // Copy incoming bytes into our struct
+  memcpy(&pkt, data, sizeof(pkt));
+
+  // Print to serial EXACTLY like your Python expects
+  Serial.printf(
+      "%u,"
+      "%0.3f,%0.3f,%0.3f,"
+      "%0.3f,%0.3f,%0.3f,"
+      "%0.3f,%0.3f,%0.3f,"
+      "%0.2f,"
+      "%0.2f,%0.2f,%0.2f\n",
+      pkt.t_us,
+      pkt.acc[0], pkt.acc[1], pkt.acc[2],
+      pkt.gyro[0],  pkt.gyro[1],  pkt.gyro[2],
+      pkt.mag[0], pkt.mag[1], pkt.mag[2],
+      pkt.temp,
+      pkt.roll, pkt.pitch, pkt.yaw
+  );
+}
+
+// -----------------------
+// Setup
+// -----------------------
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  Serial.println();
+  Serial.println("=== ESP-NOW Receiver Started ===");
+
+  // WiFi STA mode required
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  // Init ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed!");
+    return;
+  }
+
+  // Register new callback type
+  esp_now_register_recv_cb(onDataReceived);
+
+  Serial.println("ESP-NOW ready, waiting for packets…");
+}
+
+// -----------------------
+void loop() {
+  // Nothing needed – callback handles all data
+}
