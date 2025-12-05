@@ -54,8 +54,8 @@ csv_writer = csv.writer(csv_file)
 csv_writer.writerow([
     'Time_us', 'AccX', 'AccY', 'AccZ',
     'GyroX', 'GyroY', 'GyroZ',
-    'Pitch', 'Roll', 'Yaw',
     'MagX', 'MagY', 'MagZ',
+    'Pitch', 'Roll', 'Yaw',
     'Temp'
 ])
 
@@ -133,7 +133,7 @@ threading.Thread(target=serial_thread, daemon=True).start()
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("IMU Dashboard with Compass")
+        self.setWindowTitle("DATA")
         self.setGeometry(200, 100, 1600, 900)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -179,7 +179,9 @@ class MainWindow(QMainWindow):
         self.pitch_label = QLabel("Pitch: 0°")
         self.roll_label = QLabel("Roll: 0°")
         self.yaw_label = QLabel("Yaw: 0°")
-        for lbl in (self.pitch_label, self.roll_label, self.yaw_label):
+        self.temp_lable = QLabel("Temp: 0°C")
+
+        for lbl in (self.pitch_label, self.roll_label, self.yaw_label,self.temp_lable):
             lbl.setStyleSheet("font-size: 26px; font-weight: bold; padding: 10px;")
             v.addWidget(lbl)
 
@@ -233,6 +235,7 @@ class MainWindow(QMainWindow):
             self.pitch_label.setText(f"Pitch: {pitch:.2f}°")
             self.roll_label.setText(f"Roll: {roll:.2f}°")
             self.yaw_label.setText(f"Yaw: {yaw:.2f}°")
+            self.temp_lable.setText(f"Temp: {temp:.2f}°C")
 
             # CSV
             csv_writer.writerow(data)
