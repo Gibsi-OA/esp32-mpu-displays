@@ -48,13 +48,11 @@ ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
 # -----------------------------
 def parse_line(line):
     line = line.strip()
-    if not line.startswith('t='):
-        return None
-    line = line.replace('t=', '').replace('Acc:', '').replace('Gyro:', '')
     numbers = line.split()
     if len(numbers) != 7:
         return None
     return [float(x) for x in numbers]
+
 
 # -----------------------------
 # PYQTGRAPH SETUP

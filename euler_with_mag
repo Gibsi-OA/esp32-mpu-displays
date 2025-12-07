@@ -1,10 +1,13 @@
 import serial
+import serial.tools.list_ports
+import csv
 import threading
 import queue
-import csv
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtCore, QtGui
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout, QSplitter
+from pyqtgraph.Qt import QtCore
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout, QSplitter, QInputDialog
+)
 from PyQt5.QtCore import Qt
 from collections import deque
 from datetime import datetime
@@ -13,11 +16,32 @@ import math
 # -----------------------------
 # CONFIG
 # -----------------------------
-SERIAL_PORT = '/dev/ttyUSB0'
+WINDOW_SECONDS = 30
 BAUD_RATE = 115200
-WINDOW_SECONDS = 30  # show last 30 seconds
-GUI_UPDATE_MS = 20   # GUI refresh ~50Hz
-BUF_LEN = WINDOW_SECONDS * 250  # max samples in buffer (~250Hz)
+
+# -----------------------------
+# SELECT SERIAL PORT
+# -----------------------------
+def select_serial_port():
+    ports = list(serial.tools.list_ports.comports())
+    port_names = [p.device for p in ports]
+
+    if not port_names:
+        print("No serial ports found!")
+        return None
+
+    app = QApplication([])  # temporary app for dialog
+    port, ok = QInputDialog.getItem(None, "Select Serial Port", "Available COM Ports:", port_names, 0, False)
+    app.quit()
+    if ok:
+        return port
+    else:
+        return None
+
+SERIAL_PORT = select_serial_port()
+if SERIAL_PORT is None:
+    print("No port selected. Exiting.")
+    exit()
 
 # -----------------------------
 # CSV INIT
@@ -26,6 +50,7 @@ now = datetime.now()
 CSV_FILENAME = now.strftime("euler_%Y%m%d_%H%M%S.csv")
 csv_file = open(CSV_FILENAME, 'w', newline='')
 csv_writer = csv.writer(csv_file)
+
 csv_writer.writerow([
     'Time_us', 'AccX', 'AccY', 'AccZ',
     'GyroX', 'GyroY', 'GyroZ',
@@ -37,25 +62,34 @@ csv_writer.writerow([
 # -----------------------------
 # BUFFERS
 # -----------------------------
-time_buf = deque(maxlen=BUF_LEN)
-accx_buf = deque(maxlen=BUF_LEN)
-accy_buf = deque(maxlen=BUF_LEN)
-accz_buf = deque(maxlen=BUF_LEN)
-gyrox_buf = deque(maxlen=BUF_LEN)
-gyroy_buf = deque(maxlen=BUF_LEN)
-gyroz_buf = deque(maxlen=BUF_LEN)
+buf_len = WINDOW_SECONDS * 1000  # assuming 1kHz max sampling
 
-# Thread-safe queue
-q = queue.Queue(maxsize=5000)
+time_buf = deque(maxlen=buf_len)
+accx_buf = deque(maxlen=buf_len)
+accy_buf = deque(maxlen=buf_len)
+accz_buf = deque(maxlen=buf_len)
+gyrox_buf = deque(maxlen=buf_len)
+gyroy_buf = deque(maxlen=buf_len)
+gyroz_buf = deque(maxlen=buf_len)
+magx_buf = deque(maxlen=buf_len)
+magy_buf = deque(maxlen=buf_len)
+magz_buf = deque(maxlen=buf_len)
+temp_buf = deque(maxlen=buf_len)
+
+# -----------------------------
+# THREAD SAFE QUEUE
+# -----------------------------
+q = queue.Queue(maxsize=10000)
 
 # -----------------------------
 # SERIAL THREAD
 # -----------------------------
-def fast_parse(line: str):
+def parse_line(line):
+    line = line.strip()
+    s = line.split(',')
+    if len(s) != 14:
+        return None
     try:
-        s = line.strip().split(',')
-        if len(s) != 14:
-            return None
         t       = int(s[0])
         acc     = list(map(float, s[1:4]))
         gyro    = list(map(float, s[4:7]))
@@ -85,7 +119,7 @@ def serial_thread():
                 lines = buffer.split('\n')
                 buffer = lines[-1]
                 for ln in lines[:-1]:
-                    parsed = fast_parse(ln)
+                    parsed = parse_line(ln)
                     if parsed:
                         q.put(parsed, block=False)
         except:
@@ -99,86 +133,81 @@ threading.Thread(target=serial_thread, daemon=True).start()
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("IMU Dashboard 250Hz")
+        self.setWindowTitle("IMU Dashboard with Compass")
         self.setGeometry(200, 100, 1600, 900)
 
         splitter = QSplitter(Qt.Horizontal)
         self.setCentralWidget(splitter)
 
         # -------------------------
-        # Graphs
+        # LEFT: Graphs
         # -------------------------
-        graph = QWidget()
-        layout = QVBoxLayout()
-        graph.setLayout(layout)
-        self.pg = pg.GraphicsLayoutWidget()
-        layout.addWidget(self.pg)
+        graph_container = QWidget()
+        vlayout = QVBoxLayout()
+        graph_container.setLayout(vlayout)
+
+        self.pg_widget = pg.GraphicsLayoutWidget()
+        vlayout.addWidget(self.pg_widget)
 
         # ACCEL
-        self.p1 = self.pg.addPlot(title="Accelerometer (g)")
+        self.p1 = self.pg_widget.addPlot(title="Accelerometer (g)")
         self.p1.addLegend()
         self.p1.showGrid(x=True, y=True)
-        self.ax_c = self.p1.plot(pen='r', name="AccX")
-        self.ay_c = self.p1.plot(pen='g', name="AccY")
-        self.az_c = self.p1.plot(pen='b', name="AccZ")
+        self.accx_curve = self.p1.plot(pen='r', name="AccX")
+        self.accy_curve = self.p1.plot(pen='g', name="AccY")
+        self.accz_curve = self.p1.plot(pen='b', name="AccZ")
 
-        self.pg.nextRow()
         # GYRO
-        self.p2 = self.pg.addPlot(title="Gyroscope (dps)")
+        self.pg_widget.nextRow()
+        self.p2 = self.pg_widget.addPlot(title="Gyroscope (dps)")
         self.p2.addLegend()
         self.p2.showGrid(x=True, y=True)
-        self.gx_c = self.p2.plot(pen='r', name="GyroX")
-        self.gy_c = self.p2.plot(pen='g', name="GyroY")
-        self.gz_c = self.p2.plot(pen='b', name="GyroZ")
+        self.gyrox_curve = self.p2.plot(pen='r', name="GyroX")
+        self.gyroy_curve = self.p2.plot(pen='g', name="GyroY")
+        self.gyroz_curve = self.p2.plot(pen='b', name="GyroZ")
 
-        splitter.addWidget(graph)
+        splitter.addWidget(graph_container)
 
         # -------------------------
-        # Right panel (Euler + Compass)
+        # RIGHT: Euler + Compass
         # -------------------------
-        right = QWidget()
+        right_panel = QWidget()
         v = QVBoxLayout()
-        right.setLayout(v)
+        right_panel.setLayout(v)
 
+        # Euler angles
         self.pitch_label = QLabel("Pitch: 0°")
-        self.roll_label  = QLabel("Roll: 0°")
-        self.yaw_label   = QLabel("Yaw: 0°")
+        self.roll_label = QLabel("Roll: 0°")
+        self.yaw_label = QLabel("Yaw: 0°")
         for lbl in (self.pitch_label, self.roll_label, self.yaw_label):
-            lbl.setStyleSheet("font-size: 22px; font-weight: bold; padding:5px;")
+            lbl.setStyleSheet("font-size: 26px; font-weight: bold; padding: 10px;")
             v.addWidget(lbl)
 
-        # Compass view
-        self.compass_view = pg.GraphicsLayoutWidget()
-        v.addWidget(self.compass_view)
-        self.compass_plot = self.compass_view.addPlot()
-        self.compass_plot.setAspectLocked()
-        self.compass_plot.hideAxis('bottom')
-        self.compass_plot.hideAxis('left')
-        self.compass_arrow = pg.ArrowItem(angle=0, brush='r', tipAngle=30, baseAngle=20, headLen=40)
-        self.compass_plot.addItem(self.compass_arrow)
-        self.compass_arrow.setPos(0, 0)
-        self.compass_arrow.setStyle(angle=0, brush='r')
+        # Compass
+        self.compass_widget = pg.GraphicsLayoutWidget()
+        v.addWidget(self.compass_widget)
+        self.compass_view = self.compass_widget.addViewBox()
+        self.compass_view.setAspectLocked(True)
+        self.compass_arrow = pg.ArrowItem(angle=0, brush='r', tipAngle=30, headLen=30)
+        self.compass_view.addItem(self.compass_arrow)
+        self.compass_view.setRange(xRange=[-1,1], yRange=[-1,1])
 
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 6)
-        splitter.setStretchFactor(1, 4)
+        v.addStretch(1)
+        splitter.addWidget(right_panel)
 
-        # Timer for GUI update
+        splitter.setStretchFactor(0, 8)
+        splitter.setStretchFactor(1, 2)
+
+        # Update timer
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.update_gui)
-        self.timer.start(GUI_UPDATE_MS)
-
-        self.latest_mag = (1.0, 0.0, 0.0)
-        self.latest_pitch = 0
-        self.latest_roll = 0
+        self.timer.start(10)  # faster ~100Hz
 
     def update_gui(self):
         updated = False
-
         while not q.empty():
             data = q.get()
             updated = True
-
             (t, ax, ay, az,
              gx, gy, gz,
              pitch, roll, yaw,
@@ -186,6 +215,8 @@ class MainWindow(QMainWindow):
              temp) = data
 
             t_sec = t / 1e6
+
+            # Buffers
             time_buf.append(t_sec)
             accx_buf.append(ax)
             accy_buf.append(ay)
@@ -193,20 +224,28 @@ class MainWindow(QMainWindow):
             gyrox_buf.append(gx)
             gyroy_buf.append(gy)
             gyroz_buf.append(gz)
+            magx_buf.append(mx)
+            magy_buf.append(my)
+            magz_buf.append(mz)
+            temp_buf.append(temp)
 
-            self.latest_pitch = math.radians(pitch)
-            self.latest_roll  = math.radians(roll)
-            self.latest_mag   = (mx, my, mz)
+            # Euler angles
+            self.pitch_label.setText(f"Pitch: {pitch:.2f}°")
+            self.roll_label.setText(f"Roll: {roll:.2f}°")
+            self.yaw_label.setText(f"Yaw: {yaw:.2f}°")
+            
+            
 
+            # CSV
             csv_writer.writerow(data)
 
         if not updated or len(time_buf) < 2:
             return
 
-        # Trim to last WINDOW_SECONDS
+        # Keep last N seconds
         t_max = time_buf[-1]
         t_min = t_max - WINDOW_SECONDS
-        while time_buf and time_buf[0] < t_min:
+        while len(time_buf) > 0 and time_buf[0] < t_min:
             time_buf.popleft()
             accx_buf.popleft()
             accy_buf.popleft()
@@ -214,34 +253,31 @@ class MainWindow(QMainWindow):
             gyrox_buf.popleft()
             gyroy_buf.popleft()
             gyroz_buf.popleft()
-
+            magx_buf.popleft()
+            magy_buf.popleft()
+            magz_buf.popleft()
+            temp_buf.popleft()
+        
+        #show the last 20Secs
         self.p1.setXRange(t_max-20, t_max)
         self.p2.setXRange(t_max-20, t_max)
 
         # Update plots
-        self.ax_c.setData(list(time_buf), list(accx_buf))
-        self.ay_c.setData(list(time_buf), list(accy_buf))
-        self.az_c.setData(list(time_buf), list(accz_buf))
-        self.gx_c.setData(list(time_buf), list(gyrox_buf))
-        self.gy_c.setData(list(time_buf), list(gyroy_buf))
-        self.gz_c.setData(list(time_buf), list(gyroz_buf))
+        self.accx_curve.setData(list(time_buf), list(accx_buf))
+        self.accy_curve.setData(list(time_buf), list(accy_buf))
+        self.accz_curve.setData(list(time_buf), list(accz_buf))
+        self.gyrox_curve.setData(list(time_buf), list(gyrox_buf))
+        self.gyroy_curve.setData(list(time_buf), list(gyroy_buf))
+        self.gz_curve.setData(list(time_buf), list(gyroz_buf))
+        self.p1.setXRange(t_min, t_max)
+        self.p2.setXRange(t_min, t_max)
 
-        # Update Euler labels
-        self.pitch_label.setText(f"Pitch: {math.degrees(self.latest_pitch):.2f}°")
-        self.roll_label.setText(f"Roll: {math.degrees(self.latest_roll):.2f}°")
-
-        self.yaw_label.setText(f"Yaw: {yaw:.2f}°")
-
-        # Tilt-compensated compass
-        mx, my, mz = self.latest_mag
-        pitch = self.latest_pitch
-        roll  = self.latest_roll
-        # Tilt compensation
-        Xh = mx * math.cos(pitch) + mz * math.sin(pitch)
-        Yh = mx * math.sin(roll) * math.sin(pitch) + my * math.cos(roll) - mz * math.sin(roll) * math.cos(pitch)
-        heading = math.degrees(math.atan2(Yh, Xh))
-        self.compass_arrow.setStyle(angle=-heading, brush='r')
-
+        # Update compass
+        if len(magx_buf) > 0:
+            mx = magx_buf[-1]
+            my = magy_buf[-1]
+            heading = math.degrees(math.atan2(my, mx))
+            self.compass_arrow.setStyle(angle=-heading)
 
 # -----------------------------
 # RUN
@@ -249,7 +285,6 @@ class MainWindow(QMainWindow):
 app = QApplication([])
 win = MainWindow()
 win.show()
-
 try:
     app.exec_()
 finally:

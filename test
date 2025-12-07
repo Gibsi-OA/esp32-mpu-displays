@@ -1,0 +1,252 @@
+import serial
+import csv
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore
+from collections import deque
+from datetime import datetime
+import numpy as np
+import math
+from PyQt5.QtWidgets import QApplication
+
+# -----------------------------
+# MADGWICK FILTER CLASS
+# -----------------------------
+class Madgwick:
+    def __init__(self, beta=0.1):
+        self.beta = beta
+        self.q = np.array([1.0, 0.0, 0.0, 0.0])  # quaternion
+
+    def update(self, gx, gy, gz, ax, ay, az, dt):
+        q1, q2, q3, q4 = self.q
+
+        # Convert gyro deg/s -> rad/s
+        gx = math.radians(gx)
+        gy = math.radians(gy)
+        gz = math.radians(gz)
+
+        # Normalize accelerometer
+        norm = math.sqrt(ax*ax + ay*ay + az*az)
+        if norm == 0:
+            return
+        ax /= norm
+        ay /= norm
+        az /= norm
+
+        # Gradient descent algorithm
+        f1 = 2*(q2*q4 - q1*q3) - ax
+        f2 = 2*(q1*q2 + q3*q4) - ay
+        f3 = 2*(0.5 - q2*q2 - q3*q3) - az
+
+        J_11, J_12, J_13 = -2*q3,  2*q4, -2*q1
+        J_21, J_22, J_23 =  2*q2,  2*q1,  2*q4
+        J_31, J_32, J_33 = 0, -4*q2, -4*q3
+
+        step = np.array([
+            J_11*f1 + J_21*f2 + J_31*f3,
+            J_12*f1 + J_22*f2 + J_32*f3,
+            J_13*f1 + J_23*f2 + J_33*f3,
+        ])
+        step /= np.linalg.norm(step)
+
+        # Apply feedback
+        gx -= self.beta * step[0]
+        gy -= self.beta * step[1]
+        gz -= self.beta * step[2]
+
+        # Integrate quaternion rate
+        qDot1 = 0.5 * (-q2*gx - q3*gy - q4*gz)
+        qDot2 = 0.5 * ( q1*gx + q3*gz - q4*gy)
+        qDot3 = 0.5 * ( q1*gy - q2*gz + q4*gx)
+        qDot4 = 0.5 * ( q1*gz + q2*gy - q3*gx)
+
+        q1 += qDot1 * dt
+        q2 += qDot2 * dt
+        q3 += qDot3 * dt
+        q4 += qDot4 * dt
+
+        # Normalize quaternion
+        self.q = np.array([q1, q2, q3, q4])
+        self.q /= np.linalg.norm(self.q)
+
+    def get_euler(self):
+        q1, q2, q3, q4 = self.q
+        roll  = math.degrees(math.atan2(2*(q1*q2 + q3*q4), 1 - 2*(q2*q2 + q3*q3)))
+        pitch = math.degrees(math.asin(2*(q1*q3 - q4*q2)))
+        yaw   = math.degrees(math.atan2(2*(q1*q4 + q2*q3), 1 - 2*(q3*q3 + q4*q4)))
+        return roll, pitch, yaw
+
+# -----------------------------
+# CONFIGURATION
+# -----------------------------
+SERIAL_PORT = '/dev/ttyUSB0'
+BAUD_RATE = 115200
+WINDOW_SECONDS = 20
+
+# -----------------------------
+# CREATE CSV FILE
+# -----------------------------
+now = datetime.now()
+CSV_FILENAME = now.strftime("mpu6050_%Y%m%d_%H%M%S.csv")
+csv_file = open(CSV_FILENAME, 'w', newline='')
+csv_writer = csv.writer(csv_file)
+csv_writer.writerow(['Time_us','AccX_g','AccY_g','AccZ_g','GyroX_dps','GyroY_dps','GyroZ_dps','Roll_deg','Pitch_deg','Yaw_deg'])
+
+# -----------------------------
+# BUFFERS
+# -----------------------------
+N = WINDOW_SECONDS * 2000
+time_buf = deque(maxlen=N)
+accx_buf = deque(maxlen=N)
+accy_buf = deque(maxlen=N)
+accz_buf = deque(maxlen=N)
+gyrox_buf = deque(maxlen=N)
+gyroy_buf = deque(maxlen=N)
+gyroz_buf = deque(maxlen=N)
+roll_buf = deque(maxlen=N)
+pitch_buf = deque(maxlen=N)
+yaw_buf = deque(maxlen=N)
+
+# -----------------------------
+# SERIAL SETUP
+# -----------------------------
+ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+
+# -----------------------------
+# PARSE SERIAL LINE
+# -----------------------------
+def parse_line(line):
+    line = line.strip()
+    if not line.startswith('t='):
+        return None
+    numbers = line.replace('t=', '').split()
+    if len(numbers) != 7:
+        return None
+    return [float(x) for x in numbers]
+
+# -----------------------------
+# PYQTGRAPH SETUP
+# -----------------------------
+app = QApplication([])
+win = pg.GraphicsLayoutWidget(show=True, title="MPU6050 Real-Time Plot")
+win.resize(1200, 900)
+win.setWindowTitle('MPU6050 Live Plot')
+
+# Accelerometer plot
+p1 = win.addPlot(title="Accelerometer (g)")
+p1.showGrid(x=True, y=True)
+accx_curve = p1.plot(pen='r', name='AccX')
+accy_curve = p1.plot(pen='g', name='AccY')
+accz_curve = p1.plot(pen='b', name='AccZ')
+
+# Gyroscope plot
+win.nextRow()
+p2 = win.addPlot(title="Gyroscope (dps)")
+p2.showGrid(x=True, y=True)
+gyrox_curve = p2.plot(pen='r', name='GyroX')
+gyroy_curve = p2.plot(pen='g', name='GyroY')
+gyroz_curve = p2.plot(pen='b', name='GyroZ')
+
+# Euler angles plot
+win.nextRow()
+p3 = win.addPlot(title="Euler Angles (deg)")
+p3.showGrid(x=True, y=True)
+roll_curve = p3.plot(pen='r', name='Roll')
+pitch_curve = p3.plot(pen='g', name='Pitch')
+yaw_curve = p3.plot(pen='b', name='Yaw')
+
+# -----------------------------
+# MADGWICK FILTER INIT
+# -----------------------------
+madgwick = Madgwick(beta=1)
+last_time = None
+
+# -----------------------------
+# UPDATE FUNCTION
+# -----------------------------
+def update():
+    global last_time
+    while ser.in_waiting:
+        line = ser.readline().decode('utf-8', errors='ignore')
+        data = parse_line(line)
+        if not data:
+            continue
+        t_us, ax, ay, az, gx, gy, gz = data
+        t_sec = t_us / 1e6
+
+        # Initialize dt
+        if last_time is None:
+            dt = 0.001
+        else:
+            dt = t_sec - last_time
+        last_time = t_sec
+
+        # Update Madgwick filter
+        madgwick.update(gx, gy, gz, ax, ay, az, dt)
+        roll, pitch, yaw = madgwick.get_euler()
+
+        # Append to buffers
+        time_buf.append(t_sec)
+        accx_buf.append(ax)
+        accy_buf.append(ay)
+        accz_buf.append(az)
+        gyrox_buf.append(gx)
+        gyroy_buf.append(gy)
+        gyroz_buf.append(gz)
+        roll_buf.append(roll)
+        pitch_buf.append(pitch)
+        yaw_buf.append(yaw)
+
+        # Save to CSV
+        csv_writer.writerow([t_us, ax, ay, az, gx, gy, gz, roll, pitch, yaw])
+
+    if len(time_buf) == 0:
+        return
+
+    # Limit to last WINDOW_SECONDS
+    t_max = time_buf[-1]
+    t_min = t_max - WINDOW_SECONDS
+    while time_buf[0] < t_min:
+        time_buf.popleft()
+        accx_buf.popleft()
+        accy_buf.popleft()
+        accz_buf.popleft()
+        gyrox_buf.popleft()
+        gyroy_buf.popleft()
+        gyroz_buf.popleft()
+        roll_buf.popleft()
+        pitch_buf.popleft()
+        yaw_buf.popleft()
+
+    # Update plots
+    accx_curve.setData(list(time_buf), list(accx_buf))
+    accy_curve.setData(list(time_buf), list(accy_buf))
+    accz_curve.setData(list(time_buf), list(accz_buf))
+    gyrox_curve.setData(list(time_buf), list(gyrox_buf))
+    gyroy_curve.setData(list(time_buf), list(gyroy_buf))
+    gyroz_curve.setData(list(time_buf), list(gyroz_buf))
+    roll_curve.setData(list(time_buf), list(roll_buf))
+    pitch_curve.setData(list(time_buf), list(pitch_buf))
+    yaw_curve.setData(list(time_buf), list(yaw_buf))
+
+    # Set X-axis range
+    p1.setXRange(t_min, t_max)
+    p2.setXRange(t_min, t_max)
+    p3.setXRange(t_min, t_max)
+
+# -----------------------------
+# TIMER
+# -----------------------------
+timer = QtCore.QTimer()
+timer.timeout.connect(update)
+timer.start(50)  # 50 ms ~ 20 Hz update
+
+# -----------------------------
+# RUN APPLICATION
+# -----------------------------
+try:
+    app.exec_()
+except KeyboardInterrupt:
+    print("Stopped by user")
+finally:
+    ser.close()
+    csv_file.close()

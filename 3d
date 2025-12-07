@@ -1,142 +1,111 @@
 import numpy as np
 import serial
+import math
+import threading
 from vispy import scene, io, app
 from vispy.visuals.transforms import MatrixTransform
-import math
-import time
+from ahrs.filters import Madgwick
 
 # -----------------------------
-# Serial connection
-# -----------------------------
+# Serial setup
 SERIAL_PORT = "/dev/ttyUSB0"
 BAUD_RATE = 115200
+ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
 
-try:
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.001)
-    ser.reset_input_buffer()
-except Exception as e:
-    print("Cannot open serial port:", e)
-    exit()
+latest_data = None
+data_lock = threading.Lock()
 
 # -----------------------------
-# VisPy canvas
+# Gyro bias calibration
+GYRO_BIAS_SAMPLES = 200
+gyro_buffer = []
+
+def serial_thread():
+    global latest_data, gyro_buffer
+    while True:
+        try:
+            line = ser.readline().decode('utf-8').strip()
+            if not line or not line.startswith("t="):
+                continue
+            parts = line.split()
+            ax, ay, az = float(parts[1]), float(parts[2]), float(parts[3])
+            gx, gy, gz = float(parts[4]), float(parts[5]), float(parts[6])
+
+            # Collect for bias estimation
+            if len(gyro_buffer) < GYRO_BIAS_SAMPLES:
+                gyro_buffer.append([gx, gy, gz])
+            gyro_bias = np.mean(gyro_buffer, axis=0) if gyro_buffer else np.array([0.0,0.0,0.0])
+
+            # Subtract bias
+            gx -= gyro_bias[0]
+            gy -= gyro_bias[1]
+            gz -= gyro_bias[2]
+
+            with data_lock:
+                latest_data = (np.array([gx, gy, gz]), np.array([ax, ay, az]))
+        except:
+            continue
+
+threading.Thread(target=serial_thread, daemon=True).start()
+
 # -----------------------------
+# VisPy setup
 canvas = scene.SceneCanvas(keys='interactive', show=True, bgcolor='white')
 view = canvas.central_widget.add_view()
 view.camera = 'turntable'
 
-# -----------------------------
-# Load OBJ plane
-# -----------------------------
-mesh = io.read_mesh('plane.obj')
-vertices, faces = mesh[0], mesh[1]
-
+mesh_data = io.read_mesh('plane.obj')
+vertices, faces = mesh_data[0], mesh_data[1]
 plane_mesh = scene.visuals.Mesh(vertices=vertices, faces=faces,
-                                color=(0.2,0.5,1,0.8),
-                                parent=view.scene)
-
+                                color=(0.2,0.5,1,0.8), parent=view.scene)
 transform = MatrixTransform()
 plane_mesh.transform = transform
 
 # -----------------------------
-# Complementary filter state
-# -----------------------------
-roll = 0.0     # rotation around X
-pitch = 0.0    # rotation around Y
-yaw = 0.0      # rotation around Z (no accel reference → only gyro)
-
-alpha = 0.98   # complementary filter coefficient
-last_time = time.time()
-
-latest_data = None
+# Madgwick filter
+madgwick = Madgwick(frequency=60.0, beta=0.1)
+q = np.array([1.0,0.0,0.0,0.0])
+SMOOTH_ALPHA = 0.3
+roll_smooth = pitch_smooth = yaw_smooth = 0.0
 
 # -----------------------------
-# Parse incoming serial IMU data
-# FORMAT:
-# t=xxxxx AccX AccY AccZ GyroX GyroY GyroZ
-# -----------------------------
-def read_latest():
-    global latest_data
-    while ser.in_waiting:
-        try:
-            line = ser.readline().decode().strip()
-            if not line.startswith("t="):
-                continue
-            p = line.split()
-
-            ax = float(p[1])
-            ay = float(p[2])
-            az = float(p[3])
-            gx = float(p[4])
-            gy = float(p[5])
-            gz = float(p[6])
-
-            latest_data = (ax, ay, az, gx, gy, gz)
-        except:
-            pass
-
-# -----------------------------
-# IMU orientation update (60 Hz)
-# -----------------------------
-def update_plane(ev):
-    global roll, pitch, yaw, last_time
-
-    read_latest()
-    if latest_data is None:
+def update_plane(event):
+    global q, roll_smooth, pitch_smooth, yaw_smooth, latest_data
+    with data_lock:
+        data = latest_data
+    if data is None:
         return
+    gyro, acc = data
+    gyro_rad = np.deg2rad(gyro)
+    acc_norm = acc / np.linalg.norm(acc)
 
-    ax, ay, az, gx, gy, gz = latest_data
+    # Use fixed dt for consistency
+    q = madgwick.updateIMU(q, gyr=gyro_rad, acc=acc_norm)
 
-    now = time.time()
-    dt = now - last_time
-    last_time = now
+    q0, q1, q2, q3 = q
+    roll = math.atan2(2*(q0*q1 + q2*q3), 1 - 2*(q1*q1 + q2*q2))
+    pitch = math.asin(np.clip(2*(q0*q2 - q3*q1), -1.0, 1.0))
+    yaw = math.atan2(2*(q0*q3 + q1*q2), 1 - 2*(q2*q2 + q3*q3))
 
-    # --- Gyro integrate (degrees/sec → degrees)
-    roll_gyro  = roll  + gx * dt
-    pitch_gyro = pitch + gy * dt
-    yaw       += gz * dt  # yaw has no accel reference
+    # Low-pass smoothing
+    roll_smooth = SMOOTH_ALPHA * roll_smooth + (1-SMOOTH_ALPHA) * roll
+    pitch_smooth = SMOOTH_ALPHA * pitch_smooth + (1-SMOOTH_ALPHA) * pitch
+    yaw_smooth = SMOOTH_ALPHA * yaw_smooth + (1-SMOOTH_ALPHA) * yaw
 
-    # --- Accelerometer absolute roll/pitch ---
-    # roll: rotation about X
-    accel_roll  = math.degrees(math.atan2(ay, az))
+    # Rotation matrix
+    cr, sr = math.cos(roll_smooth), math.sin(roll_smooth)
+    cp, sp = math.cos(pitch_smooth), math.sin(pitch_smooth)
+    cy, sy = math.cos(yaw_smooth), math.sin(yaw_smooth)
 
-    # pitch: rotation about Y
-    accel_pitch = math.degrees(math.atan2(-ax, math.sqrt(ay*ay + az*az)))
-
-    # --- Complementary filter ---
-    roll  = alpha * roll_gyro  + (1 - alpha) * accel_roll
-    pitch = alpha * pitch_gyro + (1 - alpha) * accel_pitch
-
-    # Convert to radians
-    r = math.radians(roll)
-    p = math.radians(pitch)
-    y = math.radians(yaw)
-
-    # --- Build rotation matrices ---
-    Rx = np.array([[1, 0,        0,       0],
-                   [0, math.cos(r), -math.sin(r), 0],
-                   [0, math.sin(r),  math.cos(r), 0],
-                   [0, 0, 0, 1]])
-
-    Ry = np.array([[ math.cos(p), 0, math.sin(p), 0],
-                   [0, 1, 0, 0],
-                   [-math.sin(p), 0, math.cos(p), 0],
-                   [0, 0, 0, 1]])
-
-    Rz = np.array([[math.cos(y), -math.sin(y), 0, 0],
-                   [math.sin(y),  math.cos(y), 0, 0],
-                   [0, 0, 1, 0],
-                   [0, 0, 0, 1]])
-
-    # Apply rotation
-    transform.matrix = Rz @ Ry @ Rx
+    R = np.array([
+        [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
+        [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
+        [-sp,   cp*sr,            cp*cr]
+    ])
+    M = np.eye(4)
+    M[:3,:3] = R
+    transform.matrix = M
 
 # -----------------------------
-# Timer at 60 Hz
-# -----------------------------
-timer = app.Timer(interval=1/60, connect=update_plane, start=True)
-
-# -----------------------------
-# Run
-# -----------------------------
+timer = app.Timer(1/60, connect=update_plane, start=True)
 app.run()

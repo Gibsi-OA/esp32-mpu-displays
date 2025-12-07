@@ -61,6 +61,5 @@ with open(CSV_FILENAME, 'a', newline='') as csvfile:
 
     except KeyboardInterrupt:
         print("Stopped by user.")
-
     finally:
         ser.close()
