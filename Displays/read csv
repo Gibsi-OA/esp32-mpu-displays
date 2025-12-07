@@ -1,0 +1,260 @@
+import sys
+import csv
+import numpy as np
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QLabel, QSlider, QFileDialog, QCheckBox, QGroupBox
+)
+from PyQt5.QtCore import Qt, QTimer
+import pyqtgraph as pg
+
+# ---------- CONFIG ----------
+ACC_FS = 4000       # accel sample rate (Hz)
+GYRO_FS = 1000      # gyro sample rate (Hz)
+MAX_SAMPLES = 50000 # rolling buffer limit
+VISIBLE_WINDOW = 2.0 # seconds
+# ----------------------------
+
+class MatlabUI(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MATLAB Style IMU Viewer")
+
+        # Data buffers
+        self.t = []
+        self.acc = [[], [], []]
+        self.gyr = [[], [], []]
+
+        # Playback
+        self.idx = 0
+        self.playing = False
+
+        # Timer
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_display)
+        self.timer.start(20)  # 50 FPS
+
+        # Build UI
+        self.build_ui()
+
+    def build_ui(self):
+        main_layout = QVBoxLayout()
+        plot_layout = QHBoxLayout()
+
+        # ---------- ACCEL PLOT ----------
+        acc_layout = QVBoxLayout()
+        acc_group = QGroupBox("Accelerometer")
+        acc_group.setLayout(acc_layout)
+        self.acc_plot = pg.PlotWidget()
+        self.acc_plot.setLabel('left', 'Acceleration (g)')
+        self.acc_plot.setLabel('bottom', 'Time (s)')
+        self.acc_plot.showGrid(x=True, y=True)
+        self.acc_plot.addLegend()
+        acc_layout.addWidget(self.acc_plot)
+
+        self.acc_curves = []
+        colors = ['r', 'g', 'b']
+        acc_names = ['AccX', 'AccY', 'AccZ']
+        
+        for i in range(3):
+            curve = self.acc_plot.plot(pen=pg.mkPen(colors[i], width=2), name=acc_names[i])
+            self.acc_curves.append(curve)
+
+        # Axis checkboxes
+        cb_layout = QHBoxLayout()
+        self.acc_check = []
+        for i, axis in enumerate(["X", "Y", "Z"]):
+            cb = QCheckBox(axis)
+            cb.setChecked(True)
+            cb_layout.addWidget(cb)
+            self.acc_check.append(cb)
+        acc_layout.addLayout(cb_layout)
+        plot_layout.addWidget(acc_group, 1)
+
+        # ---------- GYRO PLOT ----------
+        gyr_layout = QVBoxLayout()
+        gyr_group = QGroupBox("Gyroscope")
+        gyr_group.setLayout(gyr_layout)
+        self.gyr_plot = pg.PlotWidget()
+        self.gyr_plot.setLabel('left', 'Angular Velocity (dps)')
+        self.gyr_plot.setLabel('bottom', 'Time (s)')
+        self.gyr_plot.showGrid(x=True, y=True)
+        self.gyr_plot.addLegend()
+        gyr_layout.addWidget(self.gyr_plot)
+
+        self.gyr_curves = []
+        gyr_names = ['GyroX', 'GyroY', 'GyroZ']
+        for i in range(3):
+            curve = self.gyr_plot.plot(pen=pg.mkPen(colors[i], width=2), name=gyr_names[i])
+            self.gyr_curves.append(curve)
+
+        # Axis checkboxes
+        cb_layout = QHBoxLayout()
+        self.gyr_check = []
+        for i, axis in enumerate(["X", "Y", "Z"]):
+            cb = QCheckBox(axis)
+            cb.setChecked(True)
+            cb_layout.addWidget(cb)
+            self.gyr_check.append(cb)
+        gyr_layout.addLayout(cb_layout)
+        plot_layout.addWidget(gyr_group, 1)
+
+        main_layout.addLayout(plot_layout)
+
+        # ---------- CONTROLS ----------
+        controls = QHBoxLayout()
+        self.btn_load = QPushButton("Load CSV")
+        self.btn_load.clicked.connect(self.load_csv)
+        self.btn_play = QPushButton("Play")
+        self.btn_play.clicked.connect(self.toggle_play)
+        self.btn_fft = QPushButton("Show FFT")
+        self.btn_fft.clicked.connect(self.show_fft)
+
+        controls.addWidget(self.btn_load)
+        controls.addWidget(self.btn_play)
+        controls.addWidget(self.btn_fft)
+
+        # Playbar
+        self.play_slider = QSlider(Qt.Horizontal)
+        self.play_slider.setRange(0, 1000)
+        self.play_slider.sliderMoved.connect(self.scrub_playbar)
+        self.play_label = QLabel("0.00 - 0.00 s")
+        controls.addWidget(QLabel("Playbar:"))
+        controls.addWidget(self.play_slider)
+        controls.addWidget(self.play_label)
+
+        main_layout.addLayout(controls)
+        self.setLayout(main_layout)
+
+    # ================= CSV =================
+    def load_csv(self):
+        path, _ = QFileDialog.getOpenFileName(self, "CSV file", "", "CSV (*.csv)")
+        if not path: return
+
+        self.t.clear()
+        for i in range(3):
+            self.acc[i].clear()
+            self.gyr[i].clear()
+
+        with open(path) as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) < 7: continue
+                try:
+                    t_val = float(row[0])/1e6  # convert us -> s
+                except ValueError:
+                    continue
+                self.t.append(t_val)
+                for i in range(3):
+                    self.acc[i].append(float(row[1+i]))
+                    self.gyr[i].append(float(row[4+i]))
+
+                # rolling buffer
+                if len(self.t) > MAX_SAMPLES:
+                    self.t.pop(0)
+                    for k in range(3):
+                        self.acc[k].pop(0)
+                        self.gyr[k].pop(0)
+        
+        # Start at index 0 (beginning)
+        self.idx = 0
+
+    # ================= PLAYBACK =================
+    def toggle_play(self):
+        self.playing = not self.playing
+        self.btn_play.setText("Pause" if self.playing else "Play")
+
+    def scrub_playbar(self):
+        if len(self.t) == 0: return
+        slider_val = self.play_slider.value() / self.play_slider.maximum()
+        idx = int(slider_val * (len(self.t) - 1))
+        self.idx = max(idx, 0)
+
+    # ================= DISPLAY =================
+    def update_display(self):
+        if len(self.t) < 10:
+            return
+
+        # ---------------- PLAYBACK ----------------
+        if self.playing:
+            self.idx += 1
+            if self.idx >= len(self.t):
+                self.idx = len(self.t) - 1
+                self.playing = False
+                self.btn_play.setText("Play")
+
+        t_array = np.array(self.t)
+        t_max = t_array[self.idx]
+        t_min = t_max - VISIBLE_WINDOW
+
+        # Find indices of visible data
+        # (no more backward scanning)
+        idx_start = np.searchsorted(t_array, t_min)
+        idx_end = self.idx + 1
+
+        t_visible = t_array[idx_start:idx_end]
+
+        # ---------------- PLAYBAR ----------------
+        slider_val = int(self.idx / max(1, len(t_array) - 1) * self.play_slider.maximum())
+        self.play_slider.blockSignals(True)
+        self.play_slider.setValue(slider_val)
+        self.play_slider.blockSignals(False)
+        self.play_label.setText(f"{t_visible[0]:.2f} - {t_visible[-1]:.2f} s")
+
+        # ---------------- ACCEL ----------------
+        for i in range(3):
+            a_visible = np.array(self.acc[i][idx_start:idx_end])
+            if self.acc_check[i].isChecked():
+                self.acc_curves[i].setData(t_visible, a_visible)
+            else:
+                self.acc_curves[i].clear()
+
+        # ---------------- GYRO ----------------
+        for i in range(3):
+            g_visible = np.array(self.gyr[i][idx_start:idx_end])
+            if self.gyr_check[i].isChecked():
+                self.gyr_curves[i].setData(t_visible, g_visible)
+            else:
+                self.gyr_curves[i].clear()
+
+        # ---------------- FIXED RANGE ----------------
+        self.acc_plot.setXRange(t_min, t_max)
+        self.gyr_plot.setXRange(t_min, t_max)
+
+
+    # ================= FFT =================
+    def show_fft(self):
+        if len(self.t) < 10: return
+        import pyqtgraph as pg
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("FFT (Accel)")
+        layout = QVBoxLayout()
+        dialog.setLayout(layout)
+
+        pw_acc = pg.PlotWidget()
+        pw_acc.setLabel('left', 'Magnitude')
+        pw_acc.setLabel('bottom', 'Frequency (Hz)')
+        pw_acc.showGrid(x=True, y=True)
+        pw_acc.addLegend()
+        layout.addWidget(pw_acc)
+
+        colors = ['r', 'g', 'b']
+        acc_names = ['AccX', 'AccY', 'AccZ']
+        N = len(self.t)
+        FFT_WINDOW = min(1024, N)
+        for i in range(3):
+            y = np.array(self.acc[i][-FFT_WINDOW:])
+            f = np.fft.rfftfreq(FFT_WINDOW, 1.0 / ACC_FS)
+            Y = np.abs(np.fft.rfft(y))
+            pw_acc.plot(f, Y, pen=pg.mkPen(colors[i], width=2), name=acc_names[i])
+        dialog.resize(800, 400)
+        dialog.exec_()
+
+# ================= RUN =================
+app = QApplication(sys.argv)
+w = MatlabUI()
+w.resize(1400, 800)
+w.show()
+sys.exit(app.exec_())
