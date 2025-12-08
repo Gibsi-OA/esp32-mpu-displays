@@ -1,0 +1,394 @@
+import serial
+import serial.tools.list_ports
+import csv
+import threading
+import queue
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout, QSplitter, QInputDialog, QGridLayout
+)
+from PyQt5.QtCore import Qt
+from collections import deque
+from datetime import datetime
+import math
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+WINDOW_SECONDS = 30
+BAUD_RATE = 115200
+
+# -----------------------------
+# SELECT SERIAL PORT
+# -----------------------------
+def select_serial_port():
+    ports = list(serial.tools.list_ports.comports())
+    port_names = [p.device for p in ports]
+
+    if not port_names:
+        print("No serial ports found!")
+        return None
+
+    # Check if QApplication is already running to avoid error
+    if not QApplication.instance():
+        app = QApplication([])
+    else:
+        app = QApplication.instance()
+        
+    port, ok = QInputDialog.getItem(None, "Select Serial Port", "Available COM Ports:", port_names, 0, False)
+    
+    if ok:
+        return port
+    else:
+        return None
+
+SERIAL_PORT = select_serial_port()
+if SERIAL_PORT is None:
+    print("No port selected. Exiting.")
+    exit()
+
+# -----------------------------
+# CSV INIT
+# -----------------------------
+now = datetime.now()
+CSV_FILENAME = now.strftime("imu_gps_%Y%m%d_%H%M%S.csv")
+csv_file = open(CSV_FILENAME, 'w', newline='')
+csv_writer = csv.writer(csv_file)
+
+# The data structure has 20 fields now
+csv_writer.writerow([
+    't_us', 'AccX', 'AccY', 'AccZ',
+    'GyroX', 'GyroY', 'GyroZ',
+    'MagX', 'MagY', 'MagZ',
+    'Temp', 'Roll', 'Pitch', 'Yaw',
+    'Lat', 'Lng', 'Speed_kmph', 'Alt_meters',
+    'Satellites', 'HDOP'
+])
+
+# -----------------------------
+# BUFFERS
+# -----------------------------
+buf_len = WINDOW_SECONDS * 4000 
+
+time_buf = deque(maxlen=buf_len)
+# MPU/AHRS
+accx_buf = deque(maxlen=buf_len)
+accy_buf = deque(maxlen=buf_len)
+accz_buf = deque(maxlen=buf_len)
+gyrox_buf = deque(maxlen=buf_len)
+gyroy_buf = deque(maxlen=buf_len)
+gyroz_buf = deque(maxlen=buf_len)
+magx_buf = deque(maxlen=buf_len)
+magy_buf = deque(maxlen=buf_len)
+magz_buf = deque(maxlen=buf_len)
+temp_buf = deque(maxlen=buf_len)
+# GPS
+lat_buf = deque(maxlen=buf_len)
+lng_buf = deque(maxlen=buf_len)
+speed_buf = deque(maxlen=buf_len)
+alt_buf = deque(maxlen=buf_len)
+sat_buf = deque(maxlen=buf_len)
+hdop_buf = deque(maxlen=buf_len)
+
+# -----------------------------
+# THREAD SAFE QUEUE
+# -----------------------------
+q = queue.Queue(maxsize=20000) 
+
+# -----------------------------
+# SERIAL THREAD
+# -----------------------------
+def parse_line(line):
+    line = line.strip()
+    s = line.split(',')
+    
+    # *** FIX: Check for 20 fields (0 to 19) ***
+    if len(s) != 20: 
+        # print(f"Warning: Line has incorrect number of fields ({len(s)}).")
+        return None
+    try:
+        # Time and MPU/AHRS
+        t       = int(s[0])
+        acc     = list(map(float, s[1:4]))
+        gyro    = list(map(float, s[4:7]))
+        mag     = list(map(float, s[7:10]))
+        temp    = float(s[10])
+        roll    = float(s[11])
+        pitch   = float(s[12])
+        yaw     = float(s[13])
+        
+        # GPS Data (Indices 14 through 19)
+        lat     = float(s[14])
+        lng     = float(s[15])
+        speed   = float(s[16])
+        alt     = float(s[17])
+        sat     = int(s[18])
+        hdop    = float(s[19]) # *** FIX: Correctly index HDOP at s[19] ***
+        
+        # Return all 20 elements
+        return [t, 
+                acc[0], acc[1], acc[2],
+                gyro[0], gyro[1], gyro[2],
+                mag[0], mag[1], mag[2],
+                temp, 
+                roll, pitch, yaw,
+                lat, lng, speed, alt, sat, hdop]
+    except Exception as e:
+        # print(f"Error parsing line: {e} - Line: {line}")
+        return None
+
+def serial_thread():
+    # Adjusted timeout to 0 for non-blocking read
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0) 
+    buffer = ""
+    while True:
+        try:
+            data = ser.read(ser.in_waiting).decode(errors='ignore')
+            if not data:
+                continue
+            
+            buffer += data
+            
+            if '\n' in buffer:
+                lines = buffer.split('\n')
+                buffer = lines[-1]
+                
+                for ln in lines[:-1]:
+                    parsed = parse_line(ln)
+                    if parsed:
+                        try:
+                            q.put_nowait(parsed)
+                        except queue.Full:
+                            pass
+        except serial.SerialException:
+            break
+        except Exception:
+            pass
+        QtCore.QThread.msleep(1) 
+
+threading.Thread(target=serial_thread, daemon=True).start()
+
+# -----------------------------
+# MAIN WINDOW
+# -----------------------------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("IMU/GPS Dashboard")
+        self.setGeometry(200, 100, 1600, 900)
+
+        splitter = QSplitter(Qt.Horizontal)
+        self.setCentralWidget(splitter)
+
+        # -------------------------
+        # LEFT: Graphs
+        # -------------------------
+        graph_container = QWidget()
+        vlayout = QVBoxLayout()
+        graph_container.setLayout(vlayout)
+
+        self.pg_widget = pg.GraphicsLayoutWidget()
+        vlayout.addWidget(self.pg_widget)
+
+        # ACCEL
+        self.p1 = self.pg_widget.addPlot(title="Accelerometer (g)")
+        self.p1.addLegend()
+        self.p1.showGrid(x=True, y=True)
+        self.accx_curve = self.p1.plot(pen='r', name="AccX")
+        self.accy_curve = self.p1.plot(pen='g', name="AccY")
+        self.accz_curve = self.p1.plot(pen='b', name="AccZ")
+
+        # GYRO
+        self.pg_widget.nextRow()
+        self.p2 = self.pg_widget.addPlot(title="Gyroscope (dps)")
+        self.p2.addLegend()
+        self.p2.showGrid(x=True, y=True)
+        self.gyrox_curve = self.p2.plot(pen='r', name="GyroX")
+        self.gyroy_curve = self.p2.plot(pen='g', name="GyroY")
+        self.gyroz_curve = self.p2.plot(pen='b', name="GyroZ") 
+
+        splitter.addWidget(graph_container)
+
+        # -------------------------
+        # RIGHT: Values and Compass
+        # -------------------------
+        right_panel = QWidget()
+        v = QVBoxLayout()
+        right_panel.setLayout(v)
+
+        # Value Display Grid
+        value_grid = QGridLayout()
+        
+        # Labels for MPU/AHRS
+        self.pitch_label = QLabel("Pitch: 0.00°")
+        self.roll_label = QLabel("Roll: 0.00°")
+        self.yaw_label = QLabel("Yaw: 0.00°")
+        self.temp_label = QLabel("Temp: 0.00°C")
+        
+        # Labels for GPS
+        self.lat_label = QLabel("Lat: 0.000000°")
+        self.lng_label = QLabel("Lng: 0.000000°")
+        self.speed_label = QLabel("Speed: 0.00 km/h")
+        self.alt_label = QLabel("Alt: 0.00 m")
+        self.sat_label = QLabel("Sats: 0")
+        self.hdop_label = QLabel("HDOP: 0.00")
+
+
+        style = "font-size: 18px; font-weight: bold; padding: 5px;"
+        
+        # Add labels to grid
+        # Row 0: AHRS
+        value_grid.addWidget(QLabel("ATTITUDE:"), 0, 0)
+        value_grid.addWidget(self.pitch_label, 0, 1)
+        value_grid.addWidget(self.roll_label, 0, 2)
+        value_grid.addWidget(self.yaw_label, 0, 3)
+        value_grid.addWidget(self.temp_label, 0, 4)
+
+        # Row 1: GPS
+        value_grid.addWidget(QLabel("GPS:"), 1, 0)
+        value_grid.addWidget(self.lat_label, 1, 1)
+        value_grid.addWidget(self.lng_label, 1, 2)
+        value_grid.addWidget(self.speed_label, 1, 3)
+        value_grid.addWidget(self.alt_label, 1, 4)
+        
+        # Row 2: GPS Status
+        value_grid.addWidget(QLabel("GPS Status:"), 2, 0)
+        value_grid.addWidget(self.sat_label, 2, 1)
+        value_grid.addWidget(self.hdop_label, 2, 2)
+        
+        # Apply style to all labels in the grid
+        for i in range(value_grid.count()):
+            widget = value_grid.itemAt(i).widget()
+            if isinstance(widget, QLabel):
+                widget.setStyleSheet(style)
+        
+        v.addLayout(value_grid)
+
+        # Compass (Magnetometer/Yaw)
+        self.compass_widget = pg.GraphicsLayoutWidget()
+        v.addWidget(self.compass_widget)
+        self.compass_view = self.compass_widget.addViewBox()
+        self.compass_view.setAspectLocked(True)
+        self.compass_view.addItem(pg.ScatterPlotItem([0], [0], size=10, pen=pg.mkPen(None), brush='k')) 
+        self.compass_arrow = pg.ArrowItem(angle=0, brush='r', tipAngle=30, headLen=30)
+        self.compass_view.addItem(self.compass_arrow)
+        self.compass_view.setRange(xRange=[-1,1], yRange=[-1,1])
+
+        v.addStretch(1)
+        splitter.addWidget(right_panel)
+
+        splitter.setStretchFactor(0, 8)
+        splitter.setStretchFactor(1, 2)
+
+        # Update timer
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_gui)
+        self.timer.start(10)  # faster ~100Hz
+
+    def update_gui(self):
+        updated = False
+        while not q.empty():
+            data = q.get()
+            updated = True
+            (t, ax, ay, az,
+             gx, gy, gz,
+             mx, my, mz,
+             temp,
+             roll, pitch, yaw,
+             lat, lng, speed, alt, sat, hdop) = data
+            
+            t_sec = t / 1e6 
+
+            # Buffers
+            time_buf.append(t_sec)
+            accx_buf.append(ax)
+            accy_buf.append(ay)
+            accz_buf.append(az)
+            gyrox_buf.append(gx)
+            gyroy_buf.append(gy)
+            gyroz_buf.append(gz)
+            magx_buf.append(mx)
+            magy_buf.append(my)
+            magz_buf.append(mz)
+            temp_buf.append(temp)
+            lat_buf.append(lat)
+            lng_buf.append(lng)
+            speed_buf.append(speed)
+            alt_buf.append(alt)
+            sat_buf.append(sat)
+            hdop_buf.append(hdop)
+            
+
+            # GUI Labels
+            self.pitch_label.setText(f"Pitch: {pitch:.2f}°")
+            self.roll_label.setText(f"Roll: {roll:.2f}°")
+            self.yaw_label.setText(f"Yaw: {yaw:.2f}°")
+            self.temp_label.setText(f"Temp: {temp:.2f}°C")
+            self.lat_label.setText(f"Lat: {lat:.6f}°")
+            self.lng_label.setText(f"Lng: {lng:.6f}°")
+            self.speed_label.setText(f"Speed: {speed:.2f} km/h")
+            self.alt_label.setText(f"Alt: {alt:.2f} m")
+            self.sat_label.setText(f"Sats: {sat}")
+            self.hdop_label.setText(f"HDOP: {hdop:.2f}")
+
+            # CSV
+            csv_writer.writerow(data)
+
+        if not updated or len(time_buf) < 2:
+            return
+
+        # Keep last N seconds (Cleanup buffers)
+        t_max = time_buf[-1]
+        t_min = t_max - WINDOW_SECONDS
+        while len(time_buf) > 0 and time_buf[0] < t_min:
+            time_buf.popleft()
+            accx_buf.popleft()
+            accy_buf.popleft()
+            accz_buf.popleft()
+            gyrox_buf.popleft()
+            gyroy_buf.popleft()
+            gyroz_buf.popleft()
+            magx_buf.popleft()
+            magy_buf.popleft()
+            magz_buf.popleft()
+            temp_buf.popleft()
+            lat_buf.popleft()
+            lng_buf.popleft()
+            speed_buf.popleft()
+            alt_buf.popleft()
+            sat_buf.popleft()
+            hdop_buf.popleft()
+        
+        # Set X-axis range to show the last 20 seconds
+        self.p1.setXRange(t_max-20, t_max)
+        self.p2.setXRange(t_max-20, t_max)
+
+        # Update plots
+        self.accx_curve.setData(list(time_buf), list(accx_buf))
+        self.accy_curve.setData(list(time_buf), list(accy_buf))
+        self.accz_curve.setData(list(time_buf), list(accz_buf))
+        self.gyrox_curve.setData(list(time_buf), list(gyrox_buf))
+        self.gyroy_curve.setData(list(time_buf), list(gyroy_buf))
+        self.gyroz_curve.setData(list(time_buf), list(gyroz_buf)) 
+
+        # Update compass (using Yaw from AHRS)
+        if len(magx_buf) > 0 and len(magy_buf) > 0:
+            # Use AHRS Yaw from the packet for heading
+            heading = yaw 
+            
+            # Adjust angle for pyqtgraph's ArrowItem 
+            self.compass_arrow.setStyle(angle=90 - heading)
+
+
+# -----------------------------
+# RUN
+# -----------------------------
+if __name__ == '__main__':
+    app = QApplication([])
+    win = MainWindow()
+    win.show()
+    try:
+        app.exec_()
+    finally:
+        csv_file.close()
