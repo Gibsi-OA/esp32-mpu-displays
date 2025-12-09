@@ -1,172 +1,165 @@
 #include <WiFi.h>
 #include <esp_now.h>
-#include <esp_wifi.h> 
+#include <esp_timer.h>
+#include <time.h>
+#include <sys/time.h>
 
-// ================= CONSTANTS & CONFIG =================
-#define RECEIVE_CHANNEL 1 
-#define SERIAL_BAUD     115200
+// ================= SETTINGS =================
+#define BAUD_RATE           115200      // Serial monitor baud rate
+uint8_t tx_peer_mac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Replace with the TX unit's MAC address
 
-// *** IMPORTANT: REPLACE WITH YOUR TX UNIT'S MAC ADDRESS ***
-uint8_t tx_peer_mac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; 
+// ================= GLOBAL VARIABLES =================
+// Buffer to hold the incoming serial command like "T1672531200000000\n"
+char serial_buffer[64]; 
+int buffer_index = 0;
 
 // ================= DATA STRUCTURES =================
-
-// 1. Time Sync Structure (Used to send time from RX back to TX)
+// 1. Time Sync Structure (Sent from RX to TX)
 struct __attribute__((packed)) TimeSyncPacket {
     int64_t unix_us; // Unix Time in Microseconds
 };
 
-// 2. Data Structure (Used to receive MPU/GPS data from TX)
-struct __attribute__((packed)) dataRx {
-    int64_t t_us;             
-    float acc[3];             
-    float gyro[3];            
-    float mag[3];             
-    float temp;               
-    float roll, pitch, yaw;   
-    double lat;               
-    double lng;               
-    float speed_kmph;         
-    float alt_meters;         
-    uint32_t satellites;      
-    uint32_t hdop_value;      
+// 2. Main Data Structure (Received from TX) - MUST match TX unit
+struct __attribute__((packed)) dataTx {
+    int64_t t_us;
+    uint32_t utc_date; // YYYYMMDD
+    uint32_t utc_time; // HHMMSScc
+    float acc[3];
+    float gyro[3];
+    float mag[3];
+    float temp;
+    float roll, pitch, yaw;
+    double lat;
+    double lng;
+    float speed_kmph;
+    float alt_meters;
+    uint32_t satellites;
+    uint32_t hdop_value;
+    float heading_deg; 
 };
 
 // ================= ESP-NOW CALLBACKS =================
 
-// *** FIX 2: Updated OnDataSent signature for newer IDF (v5.5) ***
-void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
-  // We can still extract the MAC if needed, but the original logic didn't use it.
-  if (status == ESP_NOW_SEND_SUCCESS) {
-    // Serial.println("Time Sync packet relayed successfully to TX unit.");
-  } else {
-    // Serial.println("Warning: Time Sync packet failed to relay to TX unit.");
-  }
+void OnDataSent(const esp_now_send_info_t *info, esp_now_send_status_t status) {
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        // Serial.println("Time Sync Packet sent successfully to TX.");
+    } 
 }
 
-// Callback executed when an ESP-NOW packet is received (from the TX unit)
-void OnDataRecv(const esp_now_recv_info_t * info, const uint8_t *incomingData, int len) {
-    dataRx receivedData;
-    
-    if (len != sizeof(dataRx)) {
-        return;
-    }
-    
-    memcpy(&receivedData, incomingData, sizeof(receivedData));
+/**
+ * @brief Callback function executed when data is received (from the TX unit).
+ * The received data is formatted into a single CSV line and sent to the PC via Serial.
+ */
+void OnDataRecv(const esp_now_recv_info_t * info, const uint8_t * incomingData, int len) {
+    if (len == sizeof(dataTx)) { 
+        dataTx receivedData;
+        memcpy(&receivedData, incomingData, sizeof(receivedData));
 
-    float hdop = (float)receivedData.hdop_value / 100.0;
-    dataRx& pkt = receivedData; 
-
-    // Print all 20 data fields
-    Serial.printf(
-        "%lld," 
-        "%0.6f,%0.6f,%0.6f," 
-        "%0.6f,%0.6f,%0.6f," 
-        "%0.6f,%0.6f,%0.6f," 
-        "%0.2f," 
-        "%0.2f,%0.2f,%0.2f," 
-        "%0.6f,%0.6f,"
-        "%0.2f,%0.2f," 
-        "%u,%0.2f\n",
+        // Format the received data as a single CSV line for the Python script
+        // 23 fields total
+        Serial.printf(
+            "%lld,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.2f,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f,%.2f,%u,%.2f,%.2f\n",
+            receivedData.t_us,
+            receivedData.utc_date,
+            receivedData.utc_time,
+            receivedData.acc[0], receivedData.acc[1], receivedData.acc[2],
+            receivedData.gyro[0], receivedData.gyro[1], receivedData.gyro[2],
+            receivedData.mag[0], receivedData.mag[1], receivedData.mag[2],
+            receivedData.temp,
+            receivedData.roll, receivedData.pitch, receivedData.yaw,
+            receivedData.lat, receivedData.lng, receivedData.speed_kmph, receivedData.alt_meters,
+            receivedData.satellites, (float)receivedData.hdop_value / 100.0, // HDOP
+            receivedData.heading_deg // HEADING
+        );
         
-        pkt.t_us,
-        pkt.acc[0], pkt.acc[1], pkt.acc[2],
-        pkt.gyro[0], pkt.gyro[1], pkt.gyro[2],
-        pkt.mag[0], pkt.mag[1], pkt.mag[2],
-        pkt.temp,
-        pkt.roll, pkt.pitch, pkt.yaw,
-        pkt.lat, pkt.lng,
-        pkt.speed_kmph, pkt.alt_meters,
-        pkt.satellites, hdop 
-    );
+    } 
 }
 
+// ================= TIME SYNC FROM PC =================
 
-// ================= SERIAL HANDLER (Blocking Wait) =================
-void waitForTimeSync() {
-    Serial.println("\n--- WAITING FOR PC TIME SYNC COMMAND (Press SYNC button in Python app) ---");
-    
-    bool synced = false;
-    while (!synced) {
-        if (Serial.available() > 0) {
-            if (Serial.read() == 'T') {
-                String timeStr = Serial.readStringUntil('\n');
-                timeStr.trim();
-                
-                if (timeStr.length() > 5) { 
-                    
-                    // *** FIX 1: Use strtoll() for 64-bit integer conversion ***
-                    // Convert String to a null-terminated char array (const char*)
-                    const char* time_cstr = timeStr.c_str(); 
-                    // Use strtoll to convert the string to a long long (int64_t)
-                    int64_t pc_unix_us = strtoll(time_cstr, NULL, 10); 
-                    
-                    if (pc_unix_us > 1000000) { // Simple check to ensure a non-zero time was received
-                        TimeSyncPacket syncPacket;
-                        syncPacket.unix_us = pc_unix_us;
-                        
-                        // Send the time sync packet via ESP-NOW to the TX unit
-                        esp_now_send(tx_peer_mac, (uint8_t *) &syncPacket, sizeof(TimeSyncPacket));
-                        
-                        Serial.printf("✅ Time Sync Received: Unix %lld us. Relayed to TX unit.\n", pc_unix_us);
-                        synced = true;
-                    } else {
-                         Serial.println("Warning: Received invalid or zero timestamp. Waiting again.");
-                    }
-                }
+/**
+ * @brief Sends the Unix timestamp received from the PC to the TX unit via ESP-NOW.
+ */
+void forward_time_sync(int64_t unix_us) {
+    TimeSyncPacket syncPacket;
+    syncPacket.unix_us = unix_us;
+
+    if (unix_us > 1000000000000000LL) {
+        esp_now_send(tx_peer_mac, (uint8_t *)&syncPacket, sizeof(syncPacket));
+        Serial.printf("LOG: Forwarded Time Sync: %lld us to TX.\n", unix_us);
+    } else {
+        Serial.println("LOG: Received invalid sync time from PC.");
+    }
+}
+
+/**
+ * @brief Checks the serial buffer for the 'T<timestamp>\n' command sent by Python.
+ * This is the critical change to make the RX unit listen for the sync command.
+ */
+void check_serial_sync() {
+    while (Serial.available()) {
+        char in_char = Serial.read();
+        
+        if (in_char == '\n') {
+            serial_buffer[buffer_index] = '\0'; // Null-terminate the string
+            
+            // Command format: T<Unix_Time_us>
+            if (serial_buffer[0] == 'T') {
+                char* timestamp_str = &serial_buffer[1];
+                // Use atoll to convert the string to int64_t (long long)
+                int64_t unix_us = atoll(timestamp_str); 
+                forward_time_sync(unix_us);
             }
+            
+            // Reset buffer
+            buffer_index = 0;
+            serial_buffer[0] = '\0';
+            
+        } else if (buffer_index < sizeof(serial_buffer) - 1) {
+            serial_buffer[buffer_index++] = in_char;
+        } else {
+            // Buffer overflow, reset
+            buffer_index = 0;
         }
-        // Small delay to prevent watchdog timeout during the wait
-        delay(10); 
     }
 }
 
 
 // ================= SETUP =================
 void setup() {
-    Serial.begin(SERIAL_BAUD);
-    delay(1000);
-    Serial.println("\n--- Starting ESP-NOW Receiver ---");
+    Serial.begin(BAUD_RATE);
+    delay(500);
+    Serial.println("\nStarting RX Unit - Waiting for PC Sync via Serial.");
 
-    // 1. WiFi & Channel Setup
     WiFi.mode(WIFI_STA);
-    if (esp_wifi_set_channel(RECEIVE_CHANNEL, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
-        Serial.println("Warning: Failed to set Wi-Fi channel.");
-    }
-    Serial.printf("RX MAC Address: %s\n", WiFi.macAddress().c_str());
-
-    // 2. ESP-NOW Initialization
     if (esp_now_init() != ESP_OK) {
-        Serial.println("Error initializing ESP-NOW");
-        return;
+        Serial.println("ESP-NOW init failed!");
+        while(1);
     }
+    
+    esp_now_register_send_cb(OnDataSent);
+    esp_now_register_recv_cb(OnDataRecv);
 
-    // 3. Register callbacks
-    // The OnDataSent signature now matches the required esp_now_send_cb_t type.
-    esp_now_register_send_cb(OnDataSent);      
-    esp_now_register_recv_cb(OnDataRecv);      
-
-    // 4. Register the TX unit as a peer
     esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, tx_peer_mac, 6);
-    peerInfo.channel = RECEIVE_CHANNEL;  
+    memcpy(peerInfo.peer_addr, tx_peer_mac, 6); 
+    peerInfo.channel = 1;
     peerInfo.encrypt = false;
     
-    if (esp_now_add_peer(&peerInfo) != ESP_OK){
-      Serial.println("Failed to add TX peer. Check MAC address.");
-      return;
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("Failed to add TX peer.");
+    } else {
+        Serial.printf("Registered TX peer: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                      tx_peer_mac[0], tx_peer_mac[1], tx_peer_mac[2], tx_peer_mac[3], tx_peer_mac[4], tx_peer_mac[5]);
     }
 
-    // 5. Blocking Wait for Time Sync
-    waitForTimeSync();
-
-    Serial.println("Setup Complete. Ready to receive data and log.");
-    Serial.println("\nCSV Header:");
-    Serial.println("t_us,AccX,AccY,AccZ,GyroX,GyroY,GyroZ,MagX,MagY,MagZ,Temp,Roll,Pitch,Yaw,Lat,Lng,Speed_kmph,Alt_meters,Satellites,HDOP");
+    Serial.println("RX READY. Use Python script to send sync command.");
 }
 
 // ================= LOOP =================
 void loop() {
-    // Empty loop, reception is handled by the OnDataRecv callback
+    // Check the serial port for the new command from the Python script
+    check_serial_sync();
+    
+    // Data reception is handled by the OnDataRecv callback
     delay(1); 
 }
