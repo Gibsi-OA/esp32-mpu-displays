@@ -8,7 +8,6 @@
 #include <TinyGPS++.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include <time.h>
 
 // ================= SETTINGS =================
 #define SAMPLE_RATE_HZ      4000
@@ -24,10 +23,10 @@
 #define RXD2                16
 #define TXD2                17
 
-// Replace with your RX MAC if you want unicast; leave as broadcast if needed
+// MAC address of the receiver (0xFF,0xFF,0xFF,0xFF,0xFF,0xFF is broadcast)
 uint8_t rx_peer_mac[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF}; 
 
-// ================= OBJECTS & SHARED DATA =================
+// ================= OBJECTS & DATA =================
 SPIClass hspi(HSPI);
 SPIClass sdSPI(VSPI);
 MPU9250_WE mpu(&hspi, HSPI_CS, true);
@@ -44,16 +43,15 @@ struct gpsData {
     uint32_t satellites;
     uint32_t hdop_value;
     float heading_deg;
+    uint32_t date_value;
+    uint32_t time_value;
 };
-gpsData currentGpsData = {0,0,0,0,0,0,0};
-portMUX_TYPE gpsDataMux = portMUX_INITIALIZER_UNLOCKED;
+gpsData currentGpsData = {0,0,0,0,0,0,0,0,0};
+// Mutex to protect currentGpsData from race conditions (GPS task vs. Timer ISR)
+portMUX_TYPE gpsDataMux = portMUX_INITIALIZER_UNLOCKED; 
+// FIX: Mutex to protect the ring buffer access from FreeRTOS tasks
+portMUX_TYPE ringBufferMux = portMUX_INITIALIZER_UNLOCKED;
 
-// ================= TIME SYNCH VARIABLES =================
-volatile int64_t last_sync_unix_us = 0;
-volatile int64_t last_sync_esp_us = 0;
-volatile bool time_synced = false;
-portMUX_TYPE timeSyncMux = portMUX_INITIALIZER_UNLOCKED;
-char sync_datetime_str[20] = "NOSYNC";
 
 // ================= DATA STRUCTURES =================
 struct __attribute__((packed)) TimeSyncPacket {
@@ -61,7 +59,8 @@ struct __attribute__((packed)) TimeSyncPacket {
 };
 
 struct __attribute__((packed)) dataTx {
-    int64_t t_us;
+    int64_t esp_elapsed_us;   // starts at 0
+    int64_t pc_us;            // synced once, then increments
     uint32_t utc_date;
     uint32_t utc_time;
     float acc[3];
@@ -82,35 +81,15 @@ volatile dataTx ring[BUFFER_SIZE];
 volatile uint16_t writeIndex = 0;
 volatile uint16_t sdReadIndex = 0;
 volatile uint16_t espNowReadIndex = 0;
-
-// *** FIX FOR STACK OVERFLOW: Move csvBuffer to global scope ***
 char csvBuffer[SD_WRITE_BATCH*360];
 
-// ================= SYNCHRONIZED TIME FUNCTIONS =================
-int64_t getAccurateTimeUS() {
-    int64_t current_time;
-    portENTER_CRITICAL_ISR(&timeSyncMux);
-    if (!time_synced) current_time = esp_timer_get_time();
-    else current_time = last_sync_unix_us + (esp_timer_get_time() - last_sync_esp_us);
-    portEXIT_CRITICAL_ISR(&timeSyncMux);
-    return current_time;
-}
-
-void unixUSToDateTime(int64_t unix_us, uint32_t &date, uint32_t &time_val) {
-    time_t unix_s = unix_us / 1000000;
-    uint16_t hundredths = (unix_us % 1000000) / 10000;
-    struct tm* tm_struct = gmtime(&unix_s);
-    if (tm_struct != NULL) {
-        date = (tm_struct->tm_year+1900)*10000 + (tm_struct->tm_mon+1)*100 + tm_struct->tm_mday;
-        time_val = tm_struct->tm_hour*1000000 + tm_struct->tm_min*10000 + tm_struct->tm_sec*100 + hundredths;
-    } else {
-        date = 0;
-        time_val = 0;
-    }
-}
+// ================= TIME HANDLING =================
+int64_t pc_start_us = 0;
+int64_t esp_start_us = 0;
+int64_t first_pc_stamp = 0;
+volatile bool first_sample = true;
 
 // ================= ESP-NOW CALLBACKS =================
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {}
 
 void OnTimeSyncRecv(const esp_now_recv_info_t * info, const uint8_t *incomingData, int len) {
     if (len != sizeof(TimeSyncPacket)) return;
@@ -118,21 +97,11 @@ void OnTimeSyncRecv(const esp_now_recv_info_t * info, const uint8_t *incomingDat
     TimeSyncPacket receivedSync;
     memcpy(&receivedSync, incomingData, sizeof(TimeSyncPacket));
 
-    Serial.printf("TIME SYNC RECEIVED from MAC %02X:%02X:%02X:%02X:%02X:%02X | Unix us: %lld\n",
-                  info->src_addr[0], info->src_addr[1], info->src_addr[2],
-                  info->src_addr[3], info->src_addr[4], info->src_addr[5],
-                  receivedSync.unix_us);
+    int64_t current_esp_time = esp_timer_get_time();
 
-    portENTER_CRITICAL(&timeSyncMux);
-    if (!time_synced && receivedSync.unix_us > 1000000) {
-        last_sync_unix_us = receivedSync.unix_us;
-        last_sync_esp_us = esp_timer_get_time();
-        time_synced = true;
-
-        time_t sync_s = last_sync_unix_us / 1000000;
-    }
-
-    portEXIT_CRITICAL(&timeSyncMux);
+    pc_start_us = receivedSync.unix_us;
+    first_pc_stamp = current_esp_time;
+    Serial.printf("PC time synced: %lld\n", pc_start_us);
 }
 
 // ================= SD FILE =================
@@ -140,11 +109,12 @@ char DATA_FILE_PATH[64];
 bool createSequentialFile() {
     int fileIndex = 1;
     while (fileIndex <= 9999) {
-        snprintf(DATA_FILE_PATH, sizeof(DATA_FILE_PATH), "/data_%s_%04d.csv", sync_datetime_str, fileIndex);
+        snprintf(DATA_FILE_PATH, sizeof(DATA_FILE_PATH), "/data_%04d.csv", fileIndex);
         if (!SD.exists(DATA_FILE_PATH)) {
             dataFile = SD.open(DATA_FILE_PATH, FILE_WRITE);
             if (!dataFile) return false;
-            dataFile.println("t_us,UTC_Date,UTC_Time,AccX,AccY,AccZ,GyroX,GyroY,GyroZ,MagX,MagY,MagZ,Temp,Roll,Pitch,Yaw,Lat,Lng,Speed_kmph,Alt_meters,Satellites,HDOP,Heading_deg");
+            // NOTE: HDOP is scaled by 100 in the CSV printout (%.2f) but is stored as an integer here.
+            dataFile.println("ESP_elapsed_us,PC_time_us,UTC_Date,UTC_Time,AccX,AccY,AccZ,GyroX,GyroY,GyroZ,MagX,MagY,MagZ,Temp,Roll,Pitch,Yaw,Lat,Lng,Speed_kmph,Alt_meters,Satellites,HDOP,Heading_deg");
             dataFile.flush();
             Serial.printf("SD initialized, writing to file: %s\n", DATA_FILE_PATH);
             return true;
@@ -154,35 +124,28 @@ bool createSequentialFile() {
     return false;
 }
 
-// ================= TIMER CALLBACK (Core 0 ISR) =================
+// ================= TIMER CALLBACK (ISR) =================
 void IRAM_ATTR samplingCallback(void* arg) {
     int idx = writeIndex;
-    int64_t current_t_us = getAccurateTimeUS();
-    ring[idx].t_us = current_t_us;
+    int64_t current_esp_time = esp_timer_get_time();
 
-    uint32_t utc_date_val, utc_time_val;
-    unixUSToDateTime(current_t_us, utc_date_val, utc_time_val);
-    ring[idx].utc_date = utc_date_val;
-    ring[idx].utc_time = utc_time_val;
+    if (first_sample) {
+        esp_start_us = current_esp_time;
+        first_sample = false;
+    }
 
-    xyzFloat acc = mpu.getGValues();
-    xyzFloat gyr = mpu.getGyrValues();
-    xyzFloat mag = mpu.getMagValues();
-    float temp = mpu.getTemperature();
-
-    ring[idx].acc[0] = acc.x; ring[idx].acc[1] = acc.y; ring[idx].acc[2] = acc.z;
-    ring[idx].gyro[0] = gyr.x; ring[idx].gyro[1] = gyr.y; ring[idx].gyro[2] = gyr.z;
-    ring[idx].mag[0] = mag.x; ring[idx].mag[1] = mag.y; ring[idx].mag[2] = mag.z;
-    ring[idx].temp = temp;
-
-    filter.update(gyr.x*DEG_TO_RAD,gyr.y*DEG_TO_RAD,gyr.z*DEG_TO_RAD,
-                  acc.x,acc.y,acc.z,
-                  mag.x,mag.y,mag.z);
-    ring[idx].roll = filter.getRoll();
-    ring[idx].pitch = filter.getPitch();
-    ring[idx].yaw = filter.getYaw();
-
+    // 1. TIMING
+    ring[idx].esp_elapsed_us = current_esp_time - esp_start_us;
+    
+    if(first_pc_stamp)
+      ring[idx].pc_us = current_esp_time - first_pc_stamp + pc_start_us;
+    else
+      ring[idx].pc_us = 0;
+      
+    // 2. GPS DATA (Read from protected variable)
     portENTER_CRITICAL_ISR(&gpsDataMux);
+    ring[idx].utc_date = currentGpsData.date_value;
+    ring[idx].utc_time = currentGpsData.time_value;
     ring[idx].lat = currentGpsData.lat;
     ring[idx].lng = currentGpsData.lng;
     ring[idx].speed_kmph = currentGpsData.speed_kmph;
@@ -192,84 +155,128 @@ void IRAM_ATTR samplingCallback(void* arg) {
     ring[idx].heading_deg = currentGpsData.heading_deg;
     portEXIT_CRITICAL_ISR(&gpsDataMux);
 
-    writeIndex = (writeIndex+1)%BUFFER_SIZE;
+    // 3. IMU READING
+    xyzFloat acc = mpu.getGValues();
+    xyzFloat gyr = mpu.getGyrValues();
+    xyzFloat mag = mpu.getMagValues();
+    ring[idx].temp = mpu.getTemperature();
+
+    ring[idx].acc[0]=acc.x; ring[idx].acc[1]=acc.y; ring[idx].acc[2]=acc.z;
+    ring[idx].gyro[0]=gyr.x; ring[idx].gyro[1]=gyr.y; ring[idx].gyro[2]=gyr.z;
+    ring[idx].mag[0]=mag.x; ring[idx].mag[1]=mag.y; ring[idx].mag[2]=mag.z;
+
+    // 4. AHRS FILTER
+    filter.update(gyr.x*DEG_TO_RAD,gyr.y*DEG_TO_RAD,gyr.z*DEG_TO_RAD,
+                  acc.x,acc.y,acc.z,
+                  mag.x,mag.y,mag.z);
+    ring[idx].roll = filter.getRoll();
+    ring[idx].pitch = filter.getPitch();
+    ring[idx].yaw = filter.getYaw();
+
+    // 5. ADVANCE INDEX
+    writeIndex = (writeIndex+1) % BUFFER_SIZE;
 }
 
 // ================= GPS TASK =================
 void gpsTask(void* parameter) {
     for (;;) {
+        // Read all available GPS data
         while(gpsSerial.available()>0){
             if(gps.encode(gpsSerial.read())){
-                if(gps.location.isUpdated()){
+                
+                // Only update the shared variable if new location/data is available
+                if(gps.location.isUpdated() || gps.altitude.isUpdated() || gps.satellites.isUpdated() || gps.date.isUpdated()){
+                    
                     portENTER_CRITICAL(&gpsDataMux);
+                    
                     currentGpsData.lat = gps.location.lat();
                     currentGpsData.lng = gps.location.lng();
                     currentGpsData.speed_kmph = gps.speed.kmph();
                     currentGpsData.alt_meters = gps.altitude.meters();
                     currentGpsData.satellites = gps.satellites.value();
-                    currentGpsData.hdop_value = gps.hdop.value();
+                    currentGpsData.hdop_value = gps.hdop.value(); // TinyGPS++ HDOP is x100
                     currentGpsData.heading_deg = gps.course.deg();
+
+                    if (gps.date.isValid() && gps.time.isValid()) {
+                        currentGpsData.date_value = gps.date.value();
+                        currentGpsData.time_value = gps.time.value();
+                    } else {
+                        currentGpsData.date_value = 0;
+                        currentGpsData.time_value = 0;
+                    }
                     portEXIT_CRITICAL(&gpsDataMux);
-                    Serial.printf("GPS Update LAT: %.6f | Heading: %.2f | Sat: %u\n", currentGpsData.lat, currentGpsData.heading_deg, currentGpsData.satellites);
                 }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
+        // Small delay to yield to other tasks
+        vTaskDelay(pdMS_TO_TICKS(1)); 
     }
 }
 
-// ================= SD WRITER =================
+// ================= SD WRITER TASK =================
 void writeBatchToSD() {
     if(!dataFile) return;
+
     uint16_t localRead = sdReadIndex;
     uint16_t localWrite = writeIndex;
-    // char csvBuffer[SD_WRITE_BATCH*360]; // REMOVED (now global)
     char* ptr = csvBuffer;
     int lenTotal = 0;
     int batchCount = 0;
 
-    while(localRead != localWrite && batchCount<SD_WRITE_BATCH){
-        dataTx s = *(dataTx*)&ring[localRead];
-        float hdop_f = (float)s.hdop_value/100.0;
+    while(localRead != localWrite && batchCount < SD_WRITE_BATCH) {
+        dataTx s;
+        
+        // FIX: Use taskENTER/EXIT_CRITICAL with the specific ringBufferMux.
+        // This makes copying the dataTx atomic relative to the ISR that writes to the ring.
+        taskENTER_CRITICAL(&ringBufferMux);
+        memcpy(&s, (const void*)&ring[localRead], sizeof(dataTx));
+        taskEXIT_CRITICAL(&ringBufferMux);
+
+        // NOTE: HDOP is stored as an integer (x100) and divided by 100.0 here for the CSV output (%.2f).
         int len = snprintf(ptr, sizeof(csvBuffer)-lenTotal,
-            "%lld,%u,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.6f,%.6f,%.6f,%.2f,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f,%.2f,%u,%.2f,%.2f\n",
-            s.t_us, s.utc_date, s.utc_time,
+            "%lld,%lld,%u,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f,%.2f,%u,%.2f,%.2f\n",
+            s.esp_elapsed_us, s.pc_us, s.utc_date, s.utc_time,
             s.acc[0],s.acc[1],s.acc[2],
             s.gyro[0],s.gyro[1],s.gyro[2],
             s.mag[0],s.mag[1],s.mag[2],
             s.temp,
-            s.roll,s.pitch,s.yaw,
-            s.lat,s.lng,s.speed_kmph,s.alt_meters,
-            s.satellites,hdop_f,s.heading_deg);
-        if(len<=0 || lenTotal+len>=sizeof(csvBuffer)) break;
-        ptr += len; lenTotal += len;
-        localRead = (localRead+1)%BUFFER_SIZE;
+            s.roll, s.pitch, s.yaw,
+            s.lat, s.lng, s.speed_kmph, s.alt_meters,
+            s.satellites, (float)s.hdop_value/100.0, s.heading_deg);
+
+        if(len <= 0 || lenTotal + len >= sizeof(csvBuffer)) break;
+
+        ptr += len;
+        lenTotal += len;
+        localRead = (localRead + 1) % BUFFER_SIZE;
         batchCount++;
     }
-    if(lenTotal>0){
-        dataFile.write((const uint8_t*)csvBuffer,lenTotal);
+
+    if(lenTotal > 0){
+        dataFile.write((const uint8_t*)csvBuffer, lenTotal);
         dataFile.flush();
         sdReadIndex = localRead;
     }
 }
 
-// ================= ESP-NOW SEND (One Sample) =================
+// ================= ESP-NOW SEND =================
 void sendCurrentSample() {
-    // Calculate the index of the most recently written sample (one before writeIndex)
+    // Get the index of the most recently written sample
     uint16_t currentSampleIndex = (writeIndex + BUFFER_SIZE - 1) % BUFFER_SIZE;
     
-    // Only send if the index has advanced since the last send operation
-    if (currentSampleIndex == espNowReadIndex) {
-        return; // No new data to send
-    }
+    // Check if the sample has already been sent (simple rate-limiting check)
+    if (currentSampleIndex == espNowReadIndex) return;
 
-    // Retrieve the sample from the volatile ring buffer
-    // Note: The sample from the high-speed ISR is being sent.
-    dataTx s = *(dataTx*)&ring[currentSampleIndex];
+    dataTx s;
     
-    // Send the single data packet
+    // FIX: Use taskENTER/EXIT_CRITICAL with the specific ringBufferMux.
+    taskENTER_CRITICAL(&ringBufferMux);
+    memcpy(&s, (const void*)&ring[currentSampleIndex], sizeof(dataTx));
+    taskEXIT_CRITICAL(&ringBufferMux);
+    
+    // Send the data
     esp_now_send(rx_peer_mac, (uint8_t*)&s, sizeof(s));
-
+    
     // Update the read index to the sample that was just sent
     espNowReadIndex = currentSampleIndex;
 }
@@ -280,8 +287,12 @@ void setup(){
     delay(500);
     Serial.println("Starting TX with MPU and GPS...");
 
+    // 1. IMU SETUP
     hspi.begin(HSPI_SCLK, HSPI_MISO, HSPI_MOSI, HSPI_CS);
-    if(!mpu.init()) while(1);
+    if(!mpu.init()) {
+        Serial.println("MPU Init Failed!");
+        while(1);
+    }
     mpu.initMagnetometer();
     mpu.setSampleRateDivider(0);
     mpu.enableGyrDLPF();
@@ -289,29 +300,32 @@ void setup(){
     mpu.setGyrRange(MPU9250_GYRO_RANGE_2000);
     mpu.setAccRange(MPU9250_ACC_RANGE_16G);
     mpu.enableAccDLPF(false);
-    Serial.println("Calibrating gyro...");
+
     mpu.autoOffsets();
-    Serial.println("Calibration done.");
 
+    // 2. SD SETUP
     sdSPI.begin();
+    if(!SD.begin(SD_CS_PIN,sdSPI) || !createSequentialFile()){
+        Serial.println("SD init failed! Running without SD.");
+    }
+
+    // 3. GPS TASK
     gpsSerial.begin(GPS_BAUD,SERIAL_8N1,RXD2,TXD2);
-    xTaskCreatePinnedToCore(gpsTask,"GpsTask",4096,NULL,1,NULL,1);
-    Serial.println("GPS Task started on Core 1.");
+    // Pin GPS task to Core 1, priority 1
+    xTaskCreatePinnedToCore(gpsTask,"GpsTask",4096,NULL,1,NULL,1); 
 
+    // 4. ESP-NOW SETUP
     WiFi.mode(WIFI_STA);
-    if(esp_now_init()!=ESP_OK) Serial.println("ESP-NOW init failed");
-
+    esp_now_init();
     esp_now_register_recv_cb(OnTimeSyncRecv);
-
+    
     esp_now_peer_info_t peerInfo={};
     memcpy(peerInfo.peer_addr,rx_peer_mac,6);
     peerInfo.channel=1;
     peerInfo.encrypt=false;
-    if(esp_now_add_peer(&peerInfo)!=ESP_OK) Serial.println("Failed to add RX peer.");
-    else Serial.printf("Registered RX peer: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                         rx_peer_mac[0],rx_peer_mac[1],rx_peer_mac[2],
-                         rx_peer_mac[3],rx_peer_mac[4],rx_peer_mac[5]);
+    esp_now_add_peer(&peerInfo);
 
+    // 5. SAMPLING TIMER
     const esp_timer_create_args_t timer_args={
         .callback=&samplingCallback,
         .arg=NULL,
@@ -320,38 +334,25 @@ void setup(){
     };
     esp_timer_handle_t timer;
     esp_timer_create(&timer_args,&timer);
-    esp_timer_start_periodic(timer,1000000/SAMPLE_RATE_HZ);
-    Serial.printf("MPU Sampling Timer started at %d Hz on Core 0 ISR.\n",SAMPLE_RATE_HZ);
+    // Start at the desired rate
+    esp_timer_start_periodic(timer, 1000000/SAMPLE_RATE_HZ); 
 
-    Serial.println("Waiting for Time Sync command from RX unit...");
+    Serial.printf("Sampling timer at %d Hz.\n", SAMPLE_RATE_HZ);
 }
 
 // ================= LOOP =================
 void loop(){
-    if(!time_synced){
-        Serial.print(".");
-        delay(500);
-        return;
-    }
-
-    static bool sd_file_created=false;
-    if(time_synced && !sd_file_created){
-        if(!SD.begin(SD_CS_PIN,sdSPI) || !createSequentialFile()){
-            Serial.println("SD init failed on sync! Continuing without SD.");
-        }
-        sd_file_created=true;
-    }
-
-    // Rate limit the ESP-NOW transmission to ESPNOW_RATE_HZ
     static unsigned long lastSend=0;
     unsigned long now=millis();
+    
+    // ESP-NOW transmission loop
     if(now-lastSend>=1000/ESPNOW_RATE_HZ){
         lastSend=now;
-        sendCurrentSample(); // Send only the single most recent sample
+        sendCurrentSample();
     }
 
-    // Write a batch of 16 samples to the SD card when needed
-    if(sd_file_created) writeBatchToSD();
+    // SD card writing loop
+    writeBatchToSD();
 
-    delay(1);
+    delay(1); // Small delay to allow scheduler to run other tasks/IDLE
 }

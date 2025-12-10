@@ -298,15 +298,15 @@ class MainWindow(QMainWindow):
         self.pc_time_str_label = QLabel("Time (UTC): N/A")
         
         # --- NEW LABEL for formatted elapsed time ---
-        self.t_esp_fmt_label = QLabel("00:00:00.000") 
+        self.t_esp_fmt_label = QLabel("Record Time: 00:00:00.000") 
         
-        self.pitch_label = QLabel("0"); self.roll_label = QLabel("0")
-        self.yaw_label = QLabel("0"); self.temp_label = QLabel("0")
-        self.lat_label = QLabel("0"); self.lng_label = QLabel("0")
-        self.speed_label = QLabel("0"); self.alt_label = QLabel("0")
-        self.sat_label = QLabel("0"); self.hdop_label = QLabel("0")
-        self.gps_utc_time_label = QLabel("0"); self.gps_utc_date_label = QLabel("0")
-        self.heading_label = QLabel("0")
+        self.pitch_label = QLabel("Pitch: 0"); self.roll_label = QLabel("Roll: 0")
+        self.yaw_label = QLabel("Yaw: 0"); self.temp_label = QLabel("Temp: 0")
+        self.lat_label = QLabel("Lat: 0"); self.lng_label = QLabel("Lng: 0")
+        self.speed_label = QLabel("Speed: 0"); self.alt_label = QLabel("Alt: 0")
+        self.sat_label = QLabel("Sats: 0"); self.hdop_label = QLabel("HDOP: 0")
+        self.gps_utc_time_label = QLabel("GPS UTC Time: 0"); self.gps_utc_date_label = QLabel("GPS UTC Date: 0")
+        self.heading_label = QLabel("Heading: 0")
 
         # Define grid layout rows
         labels = [
@@ -314,7 +314,7 @@ class MainWindow(QMainWindow):
             ("Date", self.pc_date_str_label),
             ("Time", self.pc_time_str_label),
             ("--- IMU/GPS TIME ---", None),
-            ("Record timer", self.t_esp_fmt_label),   # Display formatted value
+            ("Record Time", self.t_esp_fmt_label),   # Display formatted value
             ("Pitch", self.pitch_label), ("Roll", self.roll_label),
             ("Yaw", self.yaw_label), ("Temp", self.temp_label),
             ("Lat", self.lat_label), ("Lng", self.lng_label),
@@ -371,7 +371,6 @@ class MainWindow(QMainWindow):
             # t_esp is already a correct Python integer (64-bit microsecond count)
             t_sec = t_esp / 1e6 
             time_buf.append(t_sec)
-            t_pc_buf.append(t_pc)
 
             accx_buf.append(ax); accy_buf.append(ay); accz_buf.append(az)
             gyrox_buf.append(gx); gyroy_buf.append(gy); gyroz_buf.append(gz)
@@ -386,10 +385,8 @@ class MainWindow(QMainWindow):
             elapsed_time_str = format_elapsed_us(t_esp) 
 
             # Update Labels
-            self.t_esp_raw_label.setText(f"{t_esp}")
             self.t_esp_fmt_label.setText(elapsed_time_str) # NEW: Update formatted elapsed time
             
-            self.pc_time_us_label.setText(f"{t_pc}")
             self.pc_date_str_label.setText(pc_date_str)
             self.pc_time_str_label.setText(pc_time_str)
 
