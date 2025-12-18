@@ -14,7 +14,7 @@
 #define HSPI_MISO           26
 #define HSPI_MOSI           27
 #define HSPI_SCLK           25
-#define HSPI_CS             16
+#define HSPI_CS             14
 #define SD_CS_PIN           5
 
 // ================= OBJECTS =================

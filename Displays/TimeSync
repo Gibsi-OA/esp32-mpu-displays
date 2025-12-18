@@ -335,18 +335,7 @@ class MainWindow(QMainWindow):
             
         v.addLayout(grid)
 
-        # -----------------------------
-        # Compass (Line)
-        # -----------------------------
-        self.compass_widget = pg.GraphicsLayoutWidget()
-        v.addWidget(self.compass_widget)
-        self.compass_view = self.compass_widget.addViewBox()
-        self.compass_view.setAspectLocked(True)
-        # Line from center (0,0) to tip (0,1) initially pointing up (North)
-        self.compass_line = pg.PlotDataItem([0,0],[0,1], pen=pg.mkPen('r', width=3))
-        self.compass_view.addItem(self.compass_line)
-        self.compass_view.setRange(xRange=[-1,1], yRange=[-1,1])
-        v.addStretch(1)
+
 
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 8)
@@ -430,12 +419,7 @@ class MainWindow(QMainWindow):
         self.gyroy_curve.setData(list(time_buf), list(gyroy_buf))
         self.gyroz_curve.setData(list(time_buf), list(gyroz_buf))
 
-        # Update compass line
-        import math
-        angle_rad = math.radians(yaw)
-        x_tip = math.sin(angle_rad)
-        y_tip = math.cos(angle_rad)
-        self.compass_line.setData([0, x_tip], [0, y_tip])
+        
 
 # -----------------------------
 # RUN
