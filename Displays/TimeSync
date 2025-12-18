@@ -296,10 +296,7 @@ class MainWindow(QMainWindow):
         # --- LABELS FOR TIME & DATA ---
         self.pc_date_str_label = QLabel("Date (UTC): N/A")
         self.pc_time_str_label = QLabel("Time (UTC): N/A")
-        
-        # --- NEW LABEL for formatted elapsed time ---
         self.t_esp_fmt_label = QLabel("Record Time: 00:00:00.000") 
-        
         self.pitch_label = QLabel("Pitch: 0"); self.roll_label = QLabel("Roll: 0")
         self.yaw_label = QLabel("Yaw: 0"); self.temp_label = QLabel("Temp: 0")
         self.lat_label = QLabel("Lat: 0"); self.lng_label = QLabel("Lng: 0")
@@ -308,15 +305,16 @@ class MainWindow(QMainWindow):
         self.gps_utc_time_label = QLabel("GPS UTC Time: 0"); self.gps_utc_date_label = QLabel("GPS UTC Date: 0")
         self.heading_label = QLabel("Heading: 0")
 
-        # Define grid layout rows
+        # Grid layout rows
         labels = [
-            ("--- PC SYNC TIME ---", None),
+            ("--- TIME DATA ---", None),
             ("Date", self.pc_date_str_label),
             ("Time", self.pc_time_str_label),
-            ("--- IMU/GPS TIME ---", None),
-            ("Record Time", self.t_esp_fmt_label),   # Display formatted value
+            ("Record Time", self.t_esp_fmt_label),
+            ("--- IMU DATA ---", None),
             ("Pitch", self.pitch_label), ("Roll", self.roll_label),
             ("Yaw", self.yaw_label), ("Temp", self.temp_label),
+            ("--- GPS DATA ---", None),
             ("Lat", self.lat_label), ("Lng", self.lng_label),
             ("Speed", self.speed_label), ("Alt", self.alt_label),
             ("Sats", self.sat_label), ("HDOP", self.hdop_label),
@@ -337,15 +335,19 @@ class MainWindow(QMainWindow):
             
         v.addLayout(grid)
 
-        # Compass
+        # -----------------------------
+        # Compass (Line)
+        # -----------------------------
         self.compass_widget = pg.GraphicsLayoutWidget()
         v.addWidget(self.compass_widget)
         self.compass_view = self.compass_widget.addViewBox()
         self.compass_view.setAspectLocked(True)
-        self.compass_arrow = pg.ArrowItem(angle=0, brush='r', tipAngle=30, headLen=30)
-        self.compass_view.addItem(self.compass_arrow)
+        # Line from center (0,0) to tip (0,1) initially pointing up (North)
+        self.compass_line = pg.PlotDataItem([0,0],[0,1], pen=pg.mkPen('r', width=3))
+        self.compass_view.addItem(self.compass_line)
         self.compass_view.setRange(xRange=[-1,1], yRange=[-1,1])
         v.addStretch(1)
+
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 8)
         splitter.setStretchFactor(1, 2)
@@ -368,7 +370,6 @@ class MainWindow(QMainWindow):
              ax, ay, az, gx, gy, gz, mx, my, mz,
              temp, roll, pitch, yaw, lat, lng, speed, alt, sat, hdop, heading) = data
 
-            # t_esp is already a correct Python integer (64-bit microsecond count)
             t_sec = t_esp / 1e6 
             time_buf.append(t_sec)
 
@@ -381,20 +382,15 @@ class MainWindow(QMainWindow):
 
             # --- TIME CONVERSIONS ---
             pc_date_str, pc_time_str = unix_us_to_datetime_str(t_pc)
-            # NEW: Format elapsed time
             elapsed_time_str = format_elapsed_us(t_esp) 
 
             # Update Labels
-            self.t_esp_fmt_label.setText(elapsed_time_str) # NEW: Update formatted elapsed time
-            
+            self.t_esp_fmt_label.setText(elapsed_time_str)
             self.pc_date_str_label.setText(pc_date_str)
             self.pc_time_str_label.setText(pc_time_str)
-
-            # Use correct variables for Roll/Pitch labels 
             self.roll_label.setText(f"{roll:.2f}°") 
             self.pitch_label.setText(f"{pitch:.2f}°") 
             self.yaw_label.setText(f"{yaw:.2f}°")
-            
             self.temp_label.setText(f"{temp:.2f}°C")
             self.lat_label.setText(f"{lat:.6f}")
             self.lng_label.setText(f"{lng:.6f}")
@@ -404,7 +400,6 @@ class MainWindow(QMainWindow):
             self.hdop_label.setText(f"{hdop:.2f}")
             self.heading_label.setText(f"{heading:.2f}°")
 
-            # format and update GPS UTC
             gps_utc_time_str, gps_utc_date_str = format_utc_datetime(utc_date, utc_time)
             self.gps_utc_time_label.setText(gps_utc_time_str)
             self.gps_utc_date_label.setText(gps_utc_date_str)
@@ -414,13 +409,12 @@ class MainWindow(QMainWindow):
         if not updated or len(time_buf) < 2:
             return
 
-        # Windowing logic remains the same (based on t_esp)
+        # Windowing logic
         t_max = time_buf[-1]
         t_min = t_max - WINDOW_SECONDS
         
-        # Pruning buffers to match window time
         while len(time_buf) > 0 and time_buf[0] < t_min:
-            time_buf.popleft(); t_pc_buf.popleft(); accx_buf.popleft(); accy_buf.popleft(); accz_buf.popleft()
+            time_buf.popleft(); accx_buf.popleft(); accy_buf.popleft(); accz_buf.popleft()
             gyrox_buf.popleft(); gyroy_buf.popleft(); gyroz_buf.popleft()
             magx_buf.popleft(); magy_buf.popleft(); magz_buf.popleft()
             temp_buf.popleft(); lat_buf.popleft(); lng_buf.popleft(); speed_buf.popleft(); alt_buf.popleft()
@@ -436,9 +430,12 @@ class MainWindow(QMainWindow):
         self.gyroy_curve.setData(list(time_buf), list(gyroy_buf))
         self.gyroz_curve.setData(list(time_buf), list(gyroz_buf))
 
-        # Update compass
-        if len(time_buf) > 0:
-            self.compass_arrow.setStyle(angle=90 - yaw)
+        # Update compass line
+        import math
+        angle_rad = math.radians(yaw)
+        x_tip = math.sin(angle_rad)
+        y_tip = math.cos(angle_rad)
+        self.compass_line.setData([0, x_tip], [0, y_tip])
 
 # -----------------------------
 # RUN
