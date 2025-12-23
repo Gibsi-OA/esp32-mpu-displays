@@ -9,7 +9,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <LCDi2c.h>
-#include <Preferences.h>
 
 // ================= SETTINGS =================
 #define SAMPLE_RATE_HZ      4000
@@ -27,6 +26,7 @@
 #define TXD2                17
 #define LCD_ROWS            2
 #define LCD_COLUMNS         16
+#define LEDPIN              15
 
 uint8_t rx_peer_mac[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF}; 
 
@@ -36,16 +36,20 @@ SPIClass sdSPI(VSPI);
 MPU9250_WE mpu(&hspi, HSPI_CS, true);
 Madgwick filter;
 File dataFile;
+File logFile;
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(2);
 LCDi2c lcd(0x27, Wire);
-Preferences prefs;
-int filesize;
 
-bool REC = false, GPSValid = false;
+bool REC = false, GPSValid = false, SDValid = false, firstSDfail = true, SDFULL = false;
 float MaxX, MaxY, MaxZ;
 int sessionID = 0;
 int partCounter = 0;
+unsigned long lastSuccessfulWrite = 0;
+uint32_t totalSpace;
+uint32_t usedSpace;
+
+
 
 struct gpsData {
     double lat; double lng;
@@ -92,6 +96,23 @@ int64_t esp_start_us = 0;
 int64_t first_pc_stamp = 0;
 volatile bool first_sample = true;
 
+
+
+
+// ================= LOGGING =================
+void logEvent(const char* msg) {
+    if (!SD.cardType()) return;
+
+    if (!logFile) {
+        logFile = SD.open("/log.txt", FILE_APPEND);
+        if (!logFile) return;
+    }
+
+    logFile.printf("[%lld us] %s\n", esp_timer_get_time(), msg);
+    logFile.flush();
+}
+
+
 // ================= SD ROLLING LOGIC =================
 
 void openNewSDFile() {
@@ -99,16 +120,58 @@ void openNewSDFile() {
 
     char path[32];
     snprintf(path, sizeof(path), "/data_%04d-%d.csv", sessionID, partCounter);
-    
+
     dataFile = SD.open(path, FILE_WRITE);
     if (dataFile) {
-        // Filtered Header: No Mag, Yaw, Alt, HDOP
-        dataFile.println("ESP_us,PC_us,Date,Time,AccX,AccY,AccZ,GyrX,GyrY,GyrZ,Temp,Roll,Pitch,Lat,Lng,Spd,Sats,Head");
-        Serial.printf("Logged to: %s\n", path);
+        dataFile.println(
+            "ESP_us,PC_us,Date,Time,AccX,AccY,AccZ,"
+            "GyrX,GyrY,GyrZ,Temp,Roll,Pitch,"
+            "Lat,Lng,Spd,Sats,Head"
+        );
+        dataFile.flush();
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Opened file: %s", path);
+        logEvent(msg);
+
         partCounter++;
-        filesize = 0;
+        SDValid = true;
+        lastSuccessfulWrite = millis();
+    } else {
+        SDValid = false;
+        logEvent("Failed to open data file");
+        Serial.println("Failed to open SD file!");
     }
 }
+
+
+
+//get initial file name
+int findNextSessionID() {
+    int maxSession = 0;
+
+    File root = SD.open("/");
+    if (!root) return 1;
+
+    File file = root.openNextFile();
+    while (file) {
+        const char* name = file.name();
+
+        // Match: /data_XXXX-Y.csv
+        int s, p;
+        if (sscanf(name, "/data_%4d-%d.csv", &s, &p) == 2) {
+            if (s > maxSession) {
+                maxSession = s;
+            }
+        }
+
+        file.close();
+        file = root.openNextFile();
+    }
+
+    root.close();
+    return maxSession + 1;
+}
+
 
 // ================= CALLBACKS & ISR =================
 
@@ -202,77 +265,167 @@ void gpsTask(void* parameter) {
         taskEXIT_CRITICAL(&ringBufferMux);
 
         // 3. LCD Update
-        lcd.printf("X%.1f Y%.1f Z%.1f  ", MaxX, MaxY, MaxZ); 
-        lcd.locate(2,1);
-        lcd.printf("R%dG%d X%d Y%d Z%d   ", 
-            REC, 
-            GPSValid, 
-            (int)abs(s.acc[0]), 
-            (int)abs(s.acc[1]), 
-            (int)abs(s.acc[2])
-        );
-        lcd.home();
+        if(SDValid && !SDFULL)
+        {
+          lcd.printf("X%.1f Y%.1f Z%.1f  ", MaxX, MaxY, MaxZ); 
+          lcd.locate(2,1);
+          lcd.printf("R%dG%d X%d Y%d Z%d   ", 
+              REC, 
+              GPSValid, 
+              (int)abs(s.acc[0]), 
+              (int)abs(s.acc[1]), 
+              (int)abs(s.acc[2])
+          );
+          lcd.home();
+          digitalWrite(LEDPIN,LOW);
+        }
+        else
+        {
+          if(!SDFULL)
+          {
+            digitalWrite(LEDPIN,HIGH);
+            if(firstSDfail)
+            {
+              lcd.cls();
+              lcd.home();
+              lcd.printf("SD didn't boot");
+              firstSDfail = false;
+              
+            }
+          }
+        }
         
         vTaskDelay(pdMS_TO_TICKS(200)); 
     }
 }
 
 void writeBatchToSD() {
-    if(!dataFile) {
-        openNewSDFile(); 
-        if(!dataFile) return;
-    }
-
-    if (dataFile.size() > MAX_FILE_SIZE) {
-        openNewSDFile();
-    }
-
-    uint16_t localRead = sdReadIndex;
-    uint16_t localWrite = writeIndex;
-    char* ptr = csvBuffer;
-    int lenTotal = 0;
-    int batchCount = 0;
-
-    while(localRead != localWrite && batchCount < SD_WRITE_BATCH) {
-        dataTx s;
-        taskENTER_CRITICAL(&ringBufferMux);
-        memcpy(&s, (const void*)&ring[localRead], sizeof(dataTx));
-        taskEXIT_CRITICAL(&ringBufferMux);
-
-        // Filtered Output: No Mag, Yaw, Alt, HDOP
-        int len = snprintf(ptr, sizeof(csvBuffer)-lenTotal,
-            "%lld,%lld,%u,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f,%u,%.2f\n",
-            s.esp_elapsed_us, s.pc_us, s.utc_date, s.utc_time,
-            s.acc[0], s.acc[1], s.acc[2],
-            s.gyro[0], s.gyro[1], s.gyro[2],
-            s.temp, s.roll, s.pitch,
-            s.lat, s.lng, s.speed_kmph, s.satellites, s.heading_deg);
-
-        if(len <= 0 || lenTotal + len >= sizeof(csvBuffer)) break;
-        ptr += len;
-        lenTotal += len;
-        localRead = (localRead + 1) % BUFFER_SIZE;
-        batchCount++;
-    }
-
-    if(lenTotal > 0){
-        dataFile.write((const uint8_t*)csvBuffer, lenTotal);
+  if(!SDFULL)
+  {
+        // Check if SD card is still present/working
+        if(!dataFile || SDFULL) {
+            openNewSDFile(); 
+            if(!dataFile) {
+                REC = false;
+                SDValid = false;
+                return;
+            }
+        }
+    
+        // Periodic SD card health check (every 5 seconds)
+        static unsigned long lastHealthCheck = 0;
+        if (millis() - lastHealthCheck > 5000) {
+            lastHealthCheck = millis();
         
-        // Flush less frequently to improve performance
-        static int flushCounter = 0;
-        if(++flushCounter >= 10) {
-            dataFile.flush();
-            flushCounter = 0;
+            // Check SD still mounted
+            if (!SD.cardType()) {
+                Serial.println("SD card removed!");
+                if (dataFile) dataFile.close();
+                dataFile = File();
+                SDValid = false;
+                REC = false;
+        
+                lcd.cls();
+                lcd.home();
+                lcd.printf("SD REMOVED");
+                digitalWrite(LEDPIN, HIGH);
+                return;
+            }
+        
+            // Check free space
+            uint64_t totalSpace = SD.totalBytes();
+            uint64_t usedSpace  = SD.usedBytes();
+        
+            if (totalSpace - usedSpace < 10ULL * 1024 * 1024) {
+                Serial.println("SD FULL!");
+        
+                SDValid = false;
+                REC = false;
+                SDFULL = true;
+        
+                lcd.cls();
+                lcd.home();
+                lcd.printf("SD FULL");
+                digitalWrite(LEDPIN, HIGH);
+                logEvent("SD FULL CAN'T CONTINUE");
+                
+        
+                if (dataFile) dataFile.close();
+                dataFile = File();
+                return;
+            }
+            logEvent("Health check passed");
+        }
+    
+        if (dataFile.size() > MAX_FILE_SIZE) {
+            openNewSDFile();
+        }
+    
+        uint16_t localRead = sdReadIndex;
+        uint16_t localWrite = writeIndex;
+        char* ptr = csvBuffer;
+        int lenTotal = 0;
+        int batchCount = 0;
+    
+        while(localRead != localWrite && batchCount < SD_WRITE_BATCH) {
+            dataTx s;
+            taskENTER_CRITICAL(&ringBufferMux);
+            memcpy(&s, (const void*)&ring[localRead], sizeof(dataTx));
+            taskEXIT_CRITICAL(&ringBufferMux);
+    
+            // Filtered Output: No Mag, Yaw, Alt, HDOP
+            int len = snprintf(ptr, sizeof(csvBuffer)-lenTotal,
+                "%lld,%lld,%u,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f,%u,%.2f\n",
+                s.esp_elapsed_us, s.pc_us, s.utc_date, s.utc_time,
+                s.acc[0], s.acc[1], s.acc[2],
+                s.gyro[0], s.gyro[1], s.gyro[2],
+                s.temp, s.roll, s.pitch,
+                s.lat, s.lng, s.speed_kmph, s.satellites, s.heading_deg);
+    
+            if(len <= 0 || lenTotal + len >= sizeof(csvBuffer)) break;
+            ptr += len;
+            lenTotal += len;
+            localRead = (localRead + 1) % BUFFER_SIZE;
+            batchCount++;
+        }
+    
+        if(lenTotal > 0){
+            size_t bytesWritten = dataFile.write((const uint8_t*)csvBuffer, lenTotal);
+            
+            // Check if write was successful
+            if(bytesWritten != lenTotal) {
+                Serial.println("SD write failed!");
+                SDValid = false;
+                REC = false;
+                if(dataFile) dataFile.close();
+                dataFile = File();
+                return;
+            }
+            
+            // Flush less frequently to improve performance
+            static int flushCounter = 0;
+            if(++flushCounter >= 10) {
+                dataFile.flush();
+                flushCounter = 0;
+            }
+            
+            sdReadIndex = localRead;
+            lastSuccessfulWrite = millis();
+            REC = true;
+            SDValid = true;
+        } else {
+            // Nothing to write, but SD is still working
+            REC = false;
         }
         
-        sdReadIndex = localRead;
+        // If we haven't written successfully in 10 seconds, something might be wrong
+        if(millis() - lastSuccessfulWrite > 10000) {
+            Serial.println("No successful writes in 10 seconds - checking SD...");
+            if(dataFile) dataFile.close();
+            dataFile = File();
+            openNewSDFile();
+        }
     }
-    
-    if (filesize <= dataFile.size())
-        REC = true;
-    else
-        REC = false;
-    filesize = dataFile.size();
 }
 
 void sdWriteTask(void* parameter) {
@@ -284,13 +437,8 @@ void sdWriteTask(void* parameter) {
 
 void setup(){
     Serial.begin(115200);
+    pinMode(LEDPIN, OUTPUT);
     
-    // 1. Session Preferences
-    prefs.begin("logs", false);
-    sessionID = prefs.getInt("id", 0);
-    sessionID++;
-    prefs.putInt("id", sessionID);
-    prefs.end();
 
     // 2. Hardware
     lcd.begin(LCD_ROWS, LCD_COLUMNS);
@@ -302,10 +450,22 @@ void setup(){
         mpu.autoOffsets();
     }
 
+    //initiats the SD and creates new file
     sdSPI.begin();
-    if(SD.begin(SD_CS_PIN, sdSPI)){
+    if (SD.begin(SD_CS_PIN, sdSPI)) {
+        sessionID = findNextSessionID();
+        partCounter = 0;
         openNewSDFile();
+        logFile = SD.open("/log.txt", FILE_APPEND);
+        if (logFile) {
+            logFile.println();
+            logFile.println("=== BOOT ===");
+            logFile.printf("SESSION: data_%04d\n", sessionID);
+            logFile.flush();
+        }
+
     }
+    
 
     gpsSerial.begin(GPS_BAUD, SERIAL_8N1, RXD2, TXD2);
     
