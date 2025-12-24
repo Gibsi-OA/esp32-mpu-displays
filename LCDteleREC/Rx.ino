@@ -42,6 +42,7 @@ struct __attribute__((packed)) dataTx {
     uint32_t hdop_value; // Now included in output
     float heading_deg;
     bool REC;
+    char filename[14];
 };
 
 // ================= ESP-NOW CALLBACKS =================
@@ -64,7 +65,7 @@ void OnDataRecv(const esp_now_recv_info_t * info, const uint8_t * incomingData, 
         
         // --- FULL SERIAL OUTPUT INCLUDING MAG, YAW, ALT, HDOP ---
         Serial.printf(
-            "%lld,%lld,%u,%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f,%.2f,%u,%u,%.2f,%d\n",
+            "%lld,%lld,%u,%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f,%.2f,%u,%u,%.2f,%d,%s\n",
             data.esp_elapsed_us,
             data.pc_us,
             data.utc_date,
@@ -79,8 +80,9 @@ void OnDataRecv(const esp_now_recv_info_t * info, const uint8_t * incomingData, 
             data.alt_meters,  // Added altitude
             data.satellites,
             data.hdop_value,  // Added HDOP
-            data.heading_deg
-            data.REC
+            data.heading_deg,
+            data.REC,
+            data.filename
         );
     }
 }
@@ -120,7 +122,7 @@ void setup() {
     Serial.println("RX Ready. Send 'T[timestamp]' to begin.");
     
     // Updated CSV Header with ALL fields
-    Serial.println("ESP_us,PC_us,Date,Time,AccX,AccY,AccZ,GyrX,GyrY,GyrZ,MagX,MagY,MagZ,Temp,Roll,Pitch,Yaw,Lat,Lng,Speed,Alt,Sats,HDOP,Heading,REC");
+    Serial.println("ESP_us,PC_us,Date,Time,AccX,AccY,AccZ,GyrX,GyrY,GyrZ,MagX,MagY,MagZ,Temp,Roll,Pitch,Yaw,Lat,Lng,Speed,Alt,Sats,HDOP,Heading,REC,FileName");
 }
 
 void loop() {

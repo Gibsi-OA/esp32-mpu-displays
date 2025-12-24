@@ -1,0 +1,469 @@
+import serial
+import serial.tools.list_ports
+import csv
+import threading
+import queue
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout, QSplitter, QInputDialog, QGridLayout, QPushButton
+)
+from PyQt5.QtCore import Qt
+from collections import deque
+from datetime import datetime, timezone 
+import time
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+WINDOW_SECONDS = 30
+BAUD_RATE = 115200
+
+# -----------------------------
+# SELECT SERIAL PORT
+# -----------------------------
+def select_serial_port():
+    ports = list(serial.tools.list_ports.comports())
+    port_names = [p.device for p in ports]
+
+    if not port_names:
+        print("No serial ports found!")
+        return None
+
+    if not QApplication.instance():
+        app = QApplication([])
+    else:
+        app = QApplication.instance()
+        
+    port, ok = QInputDialog.getItem(None, "Select Serial Port", "Available COM Ports:", port_names, 0, False)
+    
+    if ok:
+        return port
+    else:
+        return None
+
+SERIAL_PORT = select_serial_port()
+if SERIAL_PORT is None:
+    print("No port selected. Exiting.")
+    exit()
+
+# -----------------------------
+# SERIAL CONNECTION
+# -----------------------------
+try:
+    # Use timeout=0 (non-blocking) for reading in the thread
+    ser_global = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0) 
+    print(f"Connected to {SERIAL_PORT} at {BAUD_RATE} baud.")
+except Exception as e:
+    print(f"Could not open serial port {SERIAL_PORT}: {e}")
+    exit()
+
+# -----------------------------
+# CSV INIT
+# -----------------------------
+now = datetime.now()
+CSV_FILENAME = now.strftime("imu_gps_%Y%m%d_%H%M%S.csv")
+csv_file = open(CSV_FILENAME, 'w', newline='')
+csv_writer = csv.writer(csv_file)
+
+# *** UPDATED HEADER to match 26 columns from RX Unit ***
+csv_writer.writerow([
+    'RX_ESP_elapsed_us', 'PC_time_us', 'UTC_Date', 'UTC_Time',
+    'AccX','AccY','AccZ',
+    'GyroX','GyroY','GyroZ',
+    'MagX','MagY','MagZ',
+    'Temp','Roll','Pitch','Yaw',
+    'Lat','Lng','Speed_kmph','Alt_meters',
+    'Satellites','HDOP','Heading','REC','FileName'
+])
+
+# -----------------------------
+# BUFFERS
+# -----------------------------
+buf_len = WINDOW_SECONDS * 500
+time_buf = deque(maxlen=buf_len)
+t_pc_buf = deque(maxlen=buf_len) 
+accx_buf = deque(maxlen=buf_len)
+accy_buf = deque(maxlen=buf_len)
+accz_buf = deque(maxlen=buf_len)
+gyrox_buf = deque(maxlen=buf_len)
+gyroy_buf = deque(maxlen=buf_len)
+gyroz_buf = deque(maxlen=buf_len)
+magx_buf = deque(maxlen=buf_len)
+magy_buf = deque(maxlen=buf_len)
+magz_buf = deque(maxlen=buf_len)
+temp_buf = deque(maxlen=buf_len)
+lat_buf = deque(maxlen=buf_len)
+lng_buf = deque(maxlen=buf_len)
+speed_buf = deque(maxlen=buf_len)
+alt_buf = deque(maxlen=buf_len)
+sat_buf = deque(maxlen=buf_len)
+hdop_buf = deque(maxlen=buf_len)
+
+# -----------------------------
+# THREAD SAFE QUEUE
+# -----------------------------
+q = queue.Queue(maxsize=20000)
+
+# -----------------------------
+# TIME SYNC FUNCTION
+# -----------------------------
+def sync_time_to_receiver(serial_connection):
+    current_unix_us = int(time.time() * 1_000_000)
+    command = f"T{current_unix_us}\n"
+    try:
+        if serial_connection.is_open:
+            serial_connection.write(command.encode('ascii'))
+            print(f"Sent Time Sync: {command.strip()}") 
+            return True
+    except Exception as e:
+        print(f"Failed to send time sync: {e}")
+    return False
+
+# -----------------------------
+# SERIAL THREAD
+# -----------------------------
+def parse_line(line):
+    line = line.strip()
+    s = line.split(',')
+    
+    # Expecting 26 fields including REC and FileName
+    if len(s) != 26:
+        return None
+        
+    try:
+        t_esp        = int(s[0])   # RX ESP Elapsed US
+        t_pc         = int(s[1])   # PC Time US
+        utc_date     = int(s[2])   # UTC Date (from GPS)
+        utc_time     = int(s[3])   # UTC Time (from GPS)
+        acc          = list(map(float, s[4:7]))
+        gyro         = list(map(float, s[7:10]))
+        mag          = list(map(float, s[10:13]))
+        temp         = float(s[13])
+        roll         = float(s[14])
+        pitch        = float(s[15])
+        yaw          = float(s[16])
+        lat          = float(s[17])
+        lng          = float(s[18])
+        speed        = float(s[19])
+        alt          = float(s[20])
+        sat          = int(s[21])
+        hdop         = float(s[22])
+        heading      = float(s[23])
+        # REC may be sent as 0/1 or as True/False
+        rec_field    = s[24].strip()
+        try:
+            rec = int(rec_field)
+        except ValueError:
+            rec = 1 if rec_field.lower() in ('true','1','t','yes') else 0
+        filename     = s[32].strip()
+        
+        return [
+            t_esp, t_pc, utc_date, utc_time,
+            acc[0], acc[1], acc[2],
+            gyro[0], gyro[1], gyro[2],
+            mag[0], mag[1], mag[2],
+            temp, roll, pitch, yaw,
+            lat, lng, speed, alt,
+            sat, hdop, heading,
+            rec, filename
+        ]
+    except ValueError:
+        return None
+    except Exception:
+        return None
+
+def serial_thread():
+    ser = ser_global
+    buffer = ""
+    while True:
+        try:
+            data = ser.read(ser.in_waiting).decode(errors='ignore') 
+            if data:
+                buffer += data
+                if '\n' in buffer:
+                    lines = buffer.split('\n')
+                    buffer = lines[-1]
+                    for ln in lines[:-1]:
+                        if ln.startswith("LOG:") or ln.startswith("TIME SYNC RECEIVED") or ln.startswith("Starting") or ln.startswith("---"):
+                            continue
+                        parsed = parse_line(ln)
+                        if parsed:
+                            try:
+                                q.put_nowait(parsed)
+                            except queue.Full:
+                                pass 
+        except serial.SerialException:
+            break
+        except Exception:
+            pass
+        QtCore.QThread.msleep(1) 
+
+threading.Thread(target=serial_thread, daemon=True).start()
+
+# -----------------------------
+# HELPER: FORMAT UTC DATE/TIME (Kept for GPS output)
+# -----------------------------
+def format_utc_datetime(utc_date, utc_time):
+    try:
+        s = str(utc_date)
+        year = int(s[0:4])
+        month = int(s[4:6])
+        day = int(s[6:8])
+        t = int(utc_time)
+        hundredths = t % 100
+        seconds = (t // 100) % 100
+        minutes = (t // 10000) % 100
+        hours = t // 1000000
+        dt_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}.{hundredths:02d}"
+        return dt_str, f"{year}-{month:02d}-{day:02d}"
+    except:
+        return f"{utc_time}", f"{utc_date}"
+
+# -----------------------------
+# HELPER: CONVERT UNIX US 
+# -----------------------------
+def unix_us_to_datetime_str(unix_us):
+    """Converts a Unix timestamp in microseconds to a formatted string."""
+    try:
+        timestamp_s = unix_us / 1_000_000.0
+        dt_object = datetime.fromtimestamp(timestamp_s, tz=timezone.utc)
+        date_str = dt_object.strftime("%Y-%m-%d")
+        time_str = dt_object.strftime("%H:%M:%S") + f".{int(dt_object.microsecond):06d}"
+        return date_str, time_str
+    except Exception:
+        return "Invalid Date", "Invalid Time"
+
+# -----------------------------
+# HELPER: CONVERT ELAPSED US TO HH:MM:SS.MS (NEW FUNCTION)
+# -----------------------------
+def format_elapsed_us(elapsed_us):
+    """Converts elapsed microseconds to HH:MM:SS.ms format."""
+    try:
+        # Convert microseconds to milliseconds (for cleaner intermediate math)
+        elapsed_ms = elapsed_us // 1000
+        
+        # Calculate milliseconds part (remainder)
+        ms = elapsed_ms % 1000
+        
+        # Calculate total seconds
+        total_seconds = elapsed_ms // 1000
+        
+        # Calculate hours, minutes, and seconds
+        seconds = total_seconds % 60
+        minutes = (total_seconds // 60) % 60
+        hours = total_seconds // 3600
+        
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{ms:03d}"
+    except Exception:
+        return "ERR: TIME"
+
+
+# -----------------------------
+# MAIN WINDOW
+# -----------------------------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("IMU/GPS Dashboard")
+        self.setGeometry(200, 100, 1600, 900)
+        splitter = QSplitter(Qt.Horizontal)
+        self.setCentralWidget(splitter)
+
+        # Left: Graphs
+        graph_container = QWidget()
+        vlayout = QVBoxLayout()
+        graph_container.setLayout(vlayout)
+        self.pg_widget = pg.GraphicsLayoutWidget()
+        vlayout.addWidget(self.pg_widget)
+
+        self.p1 = self.pg_widget.addPlot(title="Accelerometer (g)")
+        self.p1.addLegend(); self.p1.showGrid(x=True,y=True)
+        self.accx_curve = self.p1.plot(pen='r', name="AccX")
+        self.accy_curve = self.p1.plot(pen='g', name="AccY")
+        self.accz_curve = self.p1.plot(pen='b', name="AccZ")
+
+        self.pg_widget.nextRow()
+        self.p2 = self.pg_widget.addPlot(title="Gyroscope (dps)")
+        self.p2.addLegend(); self.p2.showGrid(x=True,y=True)
+        self.gyrox_curve = self.p2.plot(pen='r', name="GyroX")
+        self.gyroy_curve = self.p2.plot(pen='g', name="GyroY")
+        self.gyroz_curve = self.p2.plot(pen='b', name="GyroZ")
+        splitter.addWidget(graph_container)
+
+        # Right: Values
+        right_panel = QWidget()
+        v = QVBoxLayout()
+        right_panel.setLayout(v)
+
+        self.sync_button = QPushButton("SYNC TIME (PC->ESP32)")
+        self.sync_button.clicked.connect(self.trigger_time_sync)
+        v.addWidget(self.sync_button)
+
+        grid = QGridLayout()
+        
+        # --- LABELS FOR TIME & DATA ---
+        self.pc_date_str_label = QLabel("Date (UTC): N/A")
+        self.pc_time_str_label = QLabel("Time (UTC): N/A")
+        self.t_esp_fmt_label = QLabel("Record Time: 00:00:00.000") 
+        self.pitch_label = QLabel("Pitch: 0"); self.roll_label = QLabel("Roll: 0")
+        self.yaw_label = QLabel("Yaw: 0"); self.temp_label = QLabel("Temp: 0")
+        self.lat_label = QLabel("Lat: 0"); self.lng_label = QLabel("Lng: 0")
+        self.speed_label = QLabel("Speed: 0"); self.alt_label = QLabel("Alt: 0")
+        self.sat_label = QLabel("Sats: 0"); self.hdop_label = QLabel("HDOP: 0")
+        self.gps_utc_time_label = QLabel("GPS UTC Time: 0"); self.gps_utc_date_label = QLabel("GPS UTC Date: 0")
+        self.heading_label = QLabel("Heading: 0")
+        # REC LED and filename label
+        self.rec_led_label = QLabel()
+        self.rec_led_label.setFixedSize(18, 18)
+        self.rec_led_label.setStyleSheet("background-color: #666; border-radius: 9px; border: 1px solid #333;")
+        self.filename_label = QLabel(f"File: {CSV_FILENAME}")
+
+        # Grid layout rows
+        labels = [
+            ("--- TIME DATA ---", None),
+            ("Date", self.pc_date_str_label),
+            ("Time", self.pc_time_str_label),
+            ("Record Time", self.t_esp_fmt_label),
+            ("--- IMU DATA ---", None),
+            ("Pitch", self.pitch_label), ("Roll", self.roll_label),
+            ("Yaw", self.yaw_label), ("Temp", self.temp_label),
+            ("--- GPS DATA ---", None),
+            ("Lat", self.lat_label), ("Lng", self.lng_label),
+            ("Speed", self.speed_label), ("Alt", self.alt_label),
+            ("Sats", self.sat_label), ("HDOP", self.hdop_label),
+            ("GPS Time", self.gps_utc_time_label), 
+            ("GPS Date", self.gps_utc_date_label),
+            ("Heading", self.heading_label),
+            ("REC", self.rec_led_label),
+            ("File", self.filename_label)
+        ]
+        
+        row = 0
+        for name, lbl in labels:
+            if lbl is None:
+                separator = QLabel(f"<b>{name}</b>")
+                separator.setAlignment(Qt.AlignCenter)
+                grid.addWidget(separator, row, 0, 1, 2)
+            else:
+                grid.addWidget(QLabel(name), row, 0); grid.addWidget(lbl, row, 1)
+            row += 1
+            
+        v.addLayout(grid)
+
+
+
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 8)
+        splitter.setStretchFactor(1, 2)
+
+        # Timer
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_gui)
+        self.timer.start(20) 
+
+    def trigger_time_sync(self):
+        sync_time_to_receiver(ser_global)
+
+    def update_gui(self):
+        updated = False
+        while not q.empty():
+            data = q.get()
+            updated = True
+            
+            (t_esp, t_pc, utc_date, utc_time,
+             ax, ay, az, gx, gy, gz, mx, my, mz,
+             temp, roll, pitch, yaw, lat, lng, speed, alt, sat, hdop, heading, rec, filename) = data
+
+            t_sec = t_esp / 1e6 
+            time_buf.append(t_sec)
+
+            accx_buf.append(ax); accy_buf.append(ay); accz_buf.append(az)
+            gyrox_buf.append(gx); gyroy_buf.append(gy); gyroz_buf.append(gz)
+            magx_buf.append(mx); magy_buf.append(my); magz_buf.append(mz)
+            temp_buf.append(temp)
+            lat_buf.append(lat); lng_buf.append(lng); speed_buf.append(speed); alt_buf.append(alt)
+            sat_buf.append(sat); hdop_buf.append(hdop)
+
+            # --- TIME CONVERSIONS ---
+            pc_date_str, pc_time_str = unix_us_to_datetime_str(t_pc)
+            elapsed_time_str = format_elapsed_us(t_esp) 
+
+            # Update Labels
+            self.t_esp_fmt_label.setText(elapsed_time_str)
+            self.pc_date_str_label.setText(pc_date_str)
+            self.pc_time_str_label.setText(pc_time_str)
+            self.roll_label.setText(f"{roll:.2f}°") 
+            self.pitch_label.setText(f"{pitch:.2f}°") 
+            self.yaw_label.setText(f"{yaw:.2f}°")
+            self.temp_label.setText(f"{temp:.2f}°C")
+            self.lat_label.setText(f"{lat:.6f}")
+            self.lng_label.setText(f"{lng:.6f}")
+            self.speed_label.setText(f"{speed:.2f} km/h")
+            self.alt_label.setText(f"{alt:.2f} m")
+            self.sat_label.setText(f"{sat}")
+            self.hdop_label.setText(f"{hdop:.2f}")
+            self.heading_label.setText(f"{heading:.2f}°")
+            # Update REC LED and filename
+            try:
+                if int(rec):
+                    # red LED when recording
+                    self.rec_led_label.setStyleSheet("background-color: #e53935; border-radius: 9px; border: 1px solid #900;")
+                else:
+                    self.rec_led_label.setStyleSheet("background-color: #666; border-radius: 9px; border: 1px solid #333;")
+            except Exception:
+                self.rec_led_label.setStyleSheet("background-color: #666; border-radius: 9px; border: 1px solid #333;")
+
+            # filename
+            try:
+                if filename:
+                    self.filename_label.setText(f"File: {filename}")
+            except Exception:
+                pass
+
+            gps_utc_time_str, gps_utc_date_str = format_utc_datetime(utc_date, utc_time)
+            self.gps_utc_time_label.setText(gps_utc_time_str)
+            self.gps_utc_date_label.setText(gps_utc_date_str)
+
+            csv_writer.writerow(data)
+
+        if not updated or len(time_buf) < 2:
+            return
+
+        # Windowing logic
+        t_max = time_buf[-1]
+        t_min = t_max - WINDOW_SECONDS
+        
+        while len(time_buf) > 0 and time_buf[0] < t_min:
+            time_buf.popleft(); accx_buf.popleft(); accy_buf.popleft(); accz_buf.popleft()
+            gyrox_buf.popleft(); gyroy_buf.popleft(); gyroz_buf.popleft()
+            magx_buf.popleft(); magy_buf.popleft(); magz_buf.popleft()
+            temp_buf.popleft(); lat_buf.popleft(); lng_buf.popleft(); speed_buf.popleft(); alt_buf.popleft()
+            sat_buf.popleft(); hdop_buf.popleft()
+
+        # Update plots
+        self.p1.setXRange(t_max-WINDOW_SECONDS, t_max)
+        self.p2.setXRange(t_max-WINDOW_SECONDS, t_max)
+        self.accx_curve.setData(list(time_buf), list(accx_buf))
+        self.accy_curve.setData(list(time_buf), list(accy_buf))
+        self.accz_curve.setData(list(time_buf), list(accz_buf))
+        self.gyrox_curve.setData(list(time_buf), list(gyrox_buf))
+        self.gyroy_curve.setData(list(time_buf), list(gyroy_buf))
+        self.gyroz_curve.setData(list(time_buf), list(gyroz_buf))
+
+        
+
+# -----------------------------
+# RUN
+# -----------------------------
+if __name__ == '__main__':
+    app = QApplication([])
+    win = MainWindow()
+    win.show()
+    try:
+        app.exec_()
+    finally:
+        csv_file.close()
+        if ser_global.is_open:
+            ser_global.close()
+            print("Serial connection closed.")

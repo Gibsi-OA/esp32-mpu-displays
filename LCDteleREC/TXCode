@@ -48,7 +48,7 @@ int partCounter = 0;
 unsigned long lastSuccessfulWrite = 0;
 uint32_t totalSpace;
 uint32_t usedSpace;
-
+char path[32];
 
 
 struct gpsData {
@@ -83,6 +83,7 @@ struct __attribute__((packed)) dataTx {
     uint32_t hdop_value;  // Sent via ESP-NOW, not logged to SD
     float heading_deg;
     bool REC;
+    char filename[14];
 };
 
 volatile dataTx ring[BUFFER_SIZE];
@@ -119,7 +120,7 @@ void logEvent(const char* msg) {
 void openNewSDFile() {
     if (dataFile) dataFile.close();
 
-    char path[32];
+    path[0] = '\0';
     snprintf(path, sizeof(path), "/data_%04d-%d.csv", sessionID, partCounter);
 
     dataFile = SD.open(path, FILE_WRITE);
@@ -159,7 +160,7 @@ int findNextSessionID() {
 
         // Match: /data_XXXX-Y.csv
         int s, p;
-        if (sscanf(name, "/data_%4d-%d.csv", &s, &p) == 2) {
+        if (sscanf(name, "data_%4d-%d.csv", &s, &p) == 2) {
             if (s > maxSession) {
                 maxSession = s;
             }
@@ -230,8 +231,11 @@ void IRAM_ATTR samplingCallback(void* arg) {
     ring[idx].roll = filter.getRoll();
     ring[idx].pitch = filter.getPitch();
     ring[idx].yaw = filter.getYaw();
+
     ring[idx].REC = REC;
-    
+    strncpy(
+    (char*)ring[idx].filename,path,sizeof(ring[idx].filename));
+    ring[idx].filename[sizeof(ring[idx].filename) - 1] = '\0';
 
     writeIndex = (writeIndex+1) % BUFFER_SIZE;
 }
