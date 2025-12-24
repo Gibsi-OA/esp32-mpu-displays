@@ -182,6 +182,10 @@ void OnTimeSyncRecv(const esp_now_recv_info_t * info, const uint8_t *incomingDat
     pc_start_us = receivedSync.unix_us;
     first_pc_stamp = esp_timer_get_time();
     Serial.printf("PC time synced: %lld\n", pc_start_us);
+    char msg[64];
+    snprintf(msg, sizeof(msg), "PC time synced: %lld", pc_start_us);
+    logEvent(msg);
+    
 }
 
 void IRAM_ATTR samplingCallback(void* arg) {
