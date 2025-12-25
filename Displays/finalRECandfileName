@@ -6,12 +6,16 @@ import queue
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout, QSplitter, QInputDialog, QGridLayout, QPushButton
+    QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout, QSplitter, QInputDialog, QGridLayout, QPushButton,
+    QDialog, QComboBox, QDoubleSpinBox, QHBoxLayout, QListWidget, QSpinBox, QMessageBox
 )
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont
 from collections import deque
 from datetime import datetime, timezone 
 import time
+import json
+import os
 
 # -----------------------------
 # CONFIG
@@ -127,8 +131,8 @@ def parse_line(line):
     line = line.strip()
     s = line.split(',')
     
-    # Expecting 26 fields including REC and FileName
-    if len(s) != 26:
+    # Expecting at least 26 fields including REC and FileName
+    if len(s) < 26:
         return None
         
     try:
@@ -156,7 +160,8 @@ def parse_line(line):
             rec = int(rec_field)
         except ValueError:
             rec = 1 if rec_field.lower() in ('true','1','t','yes') else 0
-        filename     = s[32].strip()
+        # filename is the last field (index 25 for 26 fields)
+        filename     = s[25].strip()
         
         return [
             t_esp, t_pc, utc_date, utc_time,
@@ -262,6 +267,130 @@ def format_elapsed_us(elapsed_us):
 # -----------------------------
 # MAIN WINDOW
 # -----------------------------
+THRESHOLDS_FILE = os.path.join(os.path.dirname(__file__), 'thresholds.json')
+
+def load_thresholds():
+    try:
+        with open(THRESHOLDS_FILE, 'r') as f:
+            d = json.load(f)
+        # Expect values as [min, max]
+        return {k: (float(v[0]), float(v[1])) for k, v in d.items()}
+    except Exception:
+        return {}
+
+def save_thresholds(th):
+    try:
+        with open(THRESHOLDS_FILE, 'w') as f:
+            json.dump({k: [v[0], v[1]] for k, v in th.items()}, f)
+    except Exception as e:
+        print("Failed to save thresholds:", e)
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None, existing_thresholds=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings - Parameter Limits")
+        self.setMinimumWidth(400)
+        self.thresholds = {} if existing_thresholds is None else dict(existing_thresholds)
+
+        # Parameters available for thresholding
+        self.params = [
+            "Pitch", "Roll", "Yaw", "Temp",
+            "Lat", "Lng", "Speed", "Alt",
+            "Sats", "Heading"
+        ]
+
+        layout = QVBoxLayout()
+
+        row = QHBoxLayout()
+        self.param_combo = QComboBox()
+        self.param_combo.addItems(self.params)
+        row.addWidget(self.param_combo)
+        self.param_combo.currentIndexChanged.connect(self.on_param_changed)
+
+        self.min_spin = QDoubleSpinBox()
+        self.min_spin.setRange(-1e9, 1e9)
+        self.min_spin.setDecimals(6)
+        self.min_spin.setValue(0.0)
+        row.addWidget(self.min_spin)
+
+        self.max_spin = QDoubleSpinBox()
+        self.max_spin.setRange(-1e9, 1e9)
+        self.max_spin.setDecimals(6)
+        self.max_spin.setValue(1.0)
+        row.addWidget(self.max_spin)
+
+        self.add_btn = QPushButton("Add/Update")
+        self.add_btn.clicked.connect(self.add_threshold)
+        row.addWidget(self.add_btn)
+
+        layout.addLayout(row)
+
+        self.list_widget = QListWidget()
+        layout.addWidget(self.list_widget)
+
+        btn_row = QHBoxLayout()
+        self.remove_btn = QPushButton("Remove Selected")
+        self.remove_btn.clicked.connect(self.remove_selected)
+        btn_row.addWidget(self.remove_btn)
+
+        self.ok_btn = QPushButton("OK")
+        self.ok_btn.clicked.connect(self.accept)
+        btn_row.addWidget(self.ok_btn)
+
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.cancel_btn)
+
+        layout.addLayout(btn_row)
+
+        self.setLayout(layout)
+        self.populate_list()
+        # initialize spinboxes from selected param if exists
+        self.on_param_changed()
+
+    def add_threshold(self):
+        param = str(self.param_combo.currentText())
+        mn = float(self.min_spin.value())
+        mx = float(self.max_spin.value())
+        if mn > mx:
+            QMessageBox.warning(self, "Invalid", "Min cannot be greater than Max")
+            return
+        self.thresholds[param] = (mn, mx)
+        self.populate_list()
+
+    def remove_selected(self):
+        item = self.list_widget.currentItem()
+        if not item:
+            return
+        text = item.text()
+        # Format: Param: mn - mx
+        pname = text.split(":", 1)[0]
+        if pname in self.thresholds:
+            del self.thresholds[pname]
+        self.populate_list()
+
+    def on_param_changed(self):
+        p = str(self.param_combo.currentText())
+        if p in self.thresholds:
+            mn, mx = self.thresholds[p]
+            try:
+                self.min_spin.setValue(float(mn))
+                self.max_spin.setValue(float(mx))
+            except Exception:
+                pass
+        else:
+            # sensible defaults
+            self.min_spin.setValue(0.0)
+            self.max_spin.setValue(1.0)
+
+    def populate_list(self):
+        self.list_widget.clear()
+        for p, (mn, mx) in sorted(self.thresholds.items()):
+            self.list_widget.addItem(f"{p}: {mn} - {mx}")
+
+    def get_thresholds(self):
+        return dict(self.thresholds)
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -300,6 +429,11 @@ class MainWindow(QMainWindow):
         self.sync_button.clicked.connect(self.trigger_time_sync)
         v.addWidget(self.sync_button)
 
+        # Settings button
+        self.settings_button = QPushButton("Settings")
+        self.settings_button.clicked.connect(self.open_settings)
+        v.addWidget(self.settings_button)
+
         grid = QGridLayout()
         
         # --- LABELS FOR TIME & DATA ---
@@ -322,6 +456,8 @@ class MainWindow(QMainWindow):
         # Grid layout rows
         labels = [
             ("--- TIME DATA ---", None),
+            ("REC", self.rec_led_label),
+            ("File", self.filename_label),
             ("Date", self.pc_date_str_label),
             ("Time", self.pc_time_str_label),
             ("Record Time", self.t_esp_fmt_label),
@@ -334,9 +470,8 @@ class MainWindow(QMainWindow):
             ("Sats", self.sat_label), ("HDOP", self.hdop_label),
             ("GPS Time", self.gps_utc_time_label), 
             ("GPS Date", self.gps_utc_date_label),
-            ("Heading", self.heading_label),
-            ("REC", self.rec_led_label),
-            ("File", self.filename_label)
+            ("Heading", self.heading_label)
+            
         ]
         
         row = 0
@@ -354,6 +489,14 @@ class MainWindow(QMainWindow):
 
 
         splitter.addWidget(right_panel)
+        # keep references for dynamic font scaling
+        self.splitter = splitter
+        self.right_panel = right_panel
+        # connect splitter movement to font scaling
+        try:
+            splitter.splitterMoved.connect(self.on_splitter_moved)
+        except Exception:
+            pass
         splitter.setStretchFactor(0, 8)
         splitter.setStretchFactor(1, 2)
 
@@ -361,6 +504,60 @@ class MainWindow(QMainWindow):
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.update_gui)
         self.timer.start(20) 
+
+        # Thresholds for parameter checks (param_name -> (min, max))
+        self.thresholds = load_thresholds()
+
+    def open_settings(self):
+        dialog = SettingsDialog(self, self.thresholds)
+        if dialog.exec_() == QDialog.Accepted:
+            self.thresholds = dialog.get_thresholds()
+            save_thresholds(self.thresholds)
+            print("Updated thresholds:", self.thresholds)
+
+    def on_splitter_moved(self, pos, index):
+        """Called when splitter moved; adjust right-panel font sizes based on width."""
+        try:
+            sizes = self.splitter.sizes()
+            if len(sizes) > 1:
+                right_w = sizes[1]
+                self.update_right_font_size(right_w)
+        except Exception:
+            pass
+
+    def update_right_font_size(self, right_width):
+        """Scale fonts in the right panel according to its width.
+
+        Uses a base width to compute a scale factor and clamps font sizes.
+        """
+        try:
+            base_width = 300.0
+            base_pt = 10.0
+            scale = float(right_width) / base_width if base_width > 0 else 1.0
+            new_pt = max(8, min(28, int(round(base_pt * scale))))
+            for lbl in self.right_panel.findChildren(QLabel):
+                f = lbl.font()
+                f.setPointSize(new_pt)
+                lbl.setFont(f)
+        except Exception:
+            pass
+
+    def check_and_style_label(self, label, value, minmax):
+        """Set label background red if value outside minmax, else clear style."""
+        try:
+            if minmax is None:
+                label.setStyleSheet("")
+                return
+            mn, mx = minmax
+            if value is None:
+                label.setStyleSheet("")
+                return
+            if value < mn or value > mx:
+                label.setStyleSheet("background-color: #FF0000;")
+            else:
+                label.setStyleSheet("")
+        except Exception:
+            label.setStyleSheet("")
 
     def trigger_time_sync(self):
         sync_time_to_receiver(ser_global)
@@ -424,6 +621,62 @@ class MainWindow(QMainWindow):
             gps_utc_time_str, gps_utc_date_str = format_utc_datetime(utc_date, utc_time)
             self.gps_utc_time_label.setText(gps_utc_time_str)
             self.gps_utc_date_label.setText(gps_utc_date_str)
+
+            # --- Threshold checking and label styling ---
+            # Map current values to parameter names used by the Settings dialog
+            current_values = {
+                "Pitch": pitch,
+                "Roll": roll,
+                "Yaw": yaw,
+                "Temp": temp,
+                "Lat": lat,
+                "Lng": lng,
+                "Speed": speed,
+                "Alt": alt,
+                "Sats": sat,
+                "HDOP": hdop,
+                "Heading": heading
+            }
+
+            label_map = {
+                "Pitch": self.pitch_label,
+                "Roll": self.roll_label,
+                "Yaw": self.yaw_label,
+                "Temp": self.temp_label,
+                "Lat": self.lat_label,
+                "Lng": self.lng_label,
+                "Speed": self.speed_label,
+                "Alt": self.alt_label,
+                "Sats": self.sat_label,
+                "HDOP": self.hdop_label,
+                "Heading": self.heading_label
+            }
+
+            for pname, limits in self.thresholds.items():
+                lbl = label_map.get(pname)
+                val = current_values.get(pname)
+                if lbl is not None:
+                    try:
+                        self.check_and_style_label(lbl, float(val), limits)
+                    except Exception:
+                        # In case val not float-convertible (e.g., None)
+                        self.check_and_style_label(lbl, None, limits)
+
+            # --- Automatic HDOP rule (independent of user settings) ---
+            try:
+                if hdop is not None:
+                    h = float(hdop)
+                    if h > 5.0 or h == 0.0:
+                        # always mark bad HDOP red regardless of user thresholds
+                        self.hdop_label.setStyleSheet("background-color: #FF0000;")
+                    else:
+                        # if user configured an HDOP threshold, respect it; otherwise clear style
+                        if "HDOP" in self.thresholds:
+                            self.check_and_style_label(self.hdop_label, h, self.thresholds.get("HDOP"))
+                        else:
+                            self.hdop_label.setStyleSheet("")
+            except Exception:
+                pass
 
             csv_writer.writerow(data)
 
